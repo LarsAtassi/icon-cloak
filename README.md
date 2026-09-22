@@ -1,4 +1,6 @@
-# IconCloak
+<p align="center"><img src="Resources/AppIcon-1024.png" width="128" alt="IconCloak icon"></p>
+
+<h1 align="center">IconCloak</h1>
 
 Hide menu bar icons on macOS 27. A small, open-source take on
 [Vanilla](https://matthewpalmer.net/vanilla/), which stopped working on macOS 27.
@@ -120,6 +122,9 @@ To make a release, bump `CFBundleShortVersionString` in `scripts/build-app.sh`, 
 package dev builds or builds not signed with the "IconCloak Dev" certificate. Always sign
 releases with the same certificate, so users keep their Accessibility permission when they
 update.
+
+The app icon is drawn by [scripts/make-icon.swift](scripts/make-icon.swift). Run it to
+regenerate `Resources/AppIcon.icns` after changing it.
 
 The code is in [Sources/IconCloak/main.swift](Sources/IconCloak/main.swift). Issues and
 pull requests are welcome, especially reports from setups other than a notched MacBook.
