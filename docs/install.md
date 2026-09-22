@@ -68,10 +68,12 @@ After launch you'll see two new items in the menu bar: `»` and a thin `|`.
   right of `|` always stay visible.
 - **Hide:** click `»`, or press **⌃⌥⌘H**. Only macOS's own `«` button stays.
 - **Show:** click `«`, or press **⌃⌥⌘H** again.
-- **Hide again automatically:** right-click `»` → **Auto-Hide**, then choose a time or
-  **Custom…**. IconCloak waits while your pointer is on the menu bar or a menu is open, so
-  it never hides an icon you're using. Choose **Off** to turn it off.
-- **Start automatically:** right-click `»` → **Launch at Login**.
+- **Settings:** right-click `»` → **Settings…**. There you'll find:
+  - **Hide icons automatically** after a number of seconds you choose. IconCloak waits while
+    your pointer is on the menu bar or a menu is open, so it never hides an icon you're using.
+  - **The keyboard shortcut**, which you can change: click it and press the new combination
+    (Esc cancels, **Reset** restores ⌃⌥⌘H).
+  - **Launch at login.**
 
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
 moves `»` back in front after a moment (your mouse pointer briefly jumps), and the icon
@@ -153,7 +155,8 @@ IconCloak can't read the app menus. This is almost always the Accessibility perm
 
 ### `»` isn't on the far left
 
-Right-click `»` → **Move » to the Far Left**. This needs the Accessibility permission.
+Right-click `»` → **Settings…** → **Move » to the Far Left**. This needs the Accessibility
+permission.
 
 ### The wrong icons are hidden
 
@@ -172,14 +175,14 @@ IconCloak sets up hiding for the display your pointer is on. Move the pointer on
 display and hide the icons again. If hiding fails, IconCloak shows the icons again right away
 and pauses auto-hide until the next successful hide.
 
-### ⌃⌥⌘H doesn't do anything
+### The keyboard shortcut doesn't do anything
 
-Another app may already use that shortcut. Clicking `»` and `«` still works. A custom
-shortcut isn't supported yet.
+Another app may already be using it. Choose a different one in **Settings…**, or use `»`
+and `«` with the mouse.
 
 ### Something else
 
-Right-click `»` → **Open Log** and include the last lines in an
+Right-click `»` → **Settings…** → **Open Log** and include the last lines in an
 [issue](https://github.com/LarsAtassi/icon-cloak/issues), together with your macOS version
 and display setup (built-in with notch, external display, …). The log only contains
 IconCloak's own layout events and the names of apps you switched to.

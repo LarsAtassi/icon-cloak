@@ -19,6 +19,7 @@ Hide menu bar icons on macOS 27. A small, open-source take on
   The icons between them get hidden. Hold **⌘** and drag icons in or out.
 - **Auto-hide (optional):** hide the icons again a set number of seconds after expanding.
   It waits while your pointer is on the menu bar or a menu is open.
+- **Settings:** auto-hide, your own keyboard shortcut and launch at login, in one window.
 - **Stays hidden when you switch apps.** IconCloak adapts to each app's menus, so hidden
   icons don't reappear next to short menus like Finder's.
 
@@ -71,8 +72,7 @@ every time you rebuild. You can delete the certificate anytime in Keychain Acces
 | Hide icons | Click `»`, or ⌃⌥⌘H |
 | Show icons | Click `«`, or ⌃⌥⌘H |
 | Choose which icons hide | Hold ⌘ and drag icons between `»` and `\|` |
-| Auto-hide after 5–60 seconds, or a custom time | Right-click `»` → Auto-Hide |
-| Menu (launch at login, move `»` to the far left, open log, quit) | Right-click `»` |
+| Settings (auto-hide, shortcut, launch at login) | Right-click `»` → Settings… |
 
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
 moves `»` back in front, so that icon joins the hidden ones. It does this with a quick
@@ -105,7 +105,6 @@ The full write-up, including what didn't work, is in [docs/how-it-works.md](docs
   to another one.
 - On displays without a notch, macOS puts its `«` near the middle of the menu bar, so
   IconCloak adds its own `«` next to your visible icons.
-- The keyboard shortcut is fixed to ⌃⌥⌘H.
 - No settings window yet. Everything is in the right-click menu.
 - It relies on how macOS 27 lays out the menu bar, which isn't a public API. A macOS update
   may break it.

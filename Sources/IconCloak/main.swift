@@ -75,6 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// while collapsed.
     private var overflowButtonFrames: [CGRect] = []
     private var clickTap: CFMachPort?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
     private var swallowNextMouseUp = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -88,6 +90,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         filler.autosaveName = "IconCloak.filler"
         configureButtons()
         registerHotKey()
+        let settings = SettingsModel.shared
+        settings.onAutoHideChanged = { [weak self] in
+            self?.autoHideSuspended = false
+            self?.scheduleAutoHide()
+            self?.log("auto-hide: \(self?.autoHideDelay.map { "\($0) s" } ?? "off")")
+        }
+        settings.onShortcutChanged = { [weak self] in self?.registerHotKey() }
+        settings.onArrangeItems = { [weak self] in self?.arrangeItems() }
+        settings.onOpenLog = { [weak self] in self?.openLog() }
+        settings.logMessage = { [weak self] in self?.log($0) }
         // Frames are only valid once macOS has laid the items out.
         toggle.isVisible = true
         divider.isVisible = true
@@ -240,49 +252,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
         let menuLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
         return windows.contains { ($0[kCGWindowLayer as String] as? Int) == menuLevel }
-    }
-
-    @objc private func pickAutoHide(_ sender: NSMenuItem) {
-        autoHideDelay = sender.tag > 0 ? sender.tag : nil
-    }
-
-    @objc private func pickCustomAutoHide() {
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
-        field.integerValue = autoHideDelay ?? 20
-        let alert = NSAlert()
-        alert.messageText = "Auto-Hide"
-        alert.informativeText = "Hide icons again after how many seconds? (1–3600)"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let seconds = field.integerValue
-        guard (1...3600).contains(seconds) else { NSSound.beep(); return }
-        autoHideDelay = seconds
-    }
-
-    private func autoHideMenu() -> NSMenu {
-        let menu = NSMenu()
-        let current = autoHideDelay
-        let off = menu.addItem(withTitle: "Off", action: #selector(pickAutoHide(_:)), keyEquivalent: "")
-        off.target = self
-        off.tag = 0
-        off.state = current == nil ? .on : .off
-        menu.addItem(.separator())
-        for seconds in Self.autoHidePresets {
-            let item = menu.addItem(withTitle: "After \(seconds) Seconds", action: #selector(pickAutoHide(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = seconds
-            item.state = current == seconds ? .on : .off
-        }
-        let isCustom = current.map { !Self.autoHidePresets.contains($0) } ?? false
-        let custom = menu.addItem(withTitle: isCustom ? "Custom (\(current!) Seconds)…" : "Custom…",
-                                  action: #selector(pickCustomAutoHide), keyEquivalent: "")
-        custom.target = self
-        custom.state = isCustom ? .on : .off
-        return menu
     }
 
     // MARK: - Fillers
@@ -638,33 +607,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showMenu(on item: NSStatusItem) {
         let menu = NSMenu()
-        menu.addItem(withTitle: "Hide/Show Icons  ⌃⌥⌘H", action: #selector(toggleFromMenu), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Move » to the Far Left", action: #selector(arrangeItems), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "\(collapsed ? "Show" : "Hide") Icons  \(Shortcut.current.description)",
+                     action: #selector(toggleFromMenu), keyEquivalent: "").target = self
         menu.addItem(.separator())
-        let autoHide = menu.addItem(withTitle: "Auto-Hide", action: nil, keyEquivalent: "")
-        autoHide.submenu = autoHideMenu()
-        let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(withTitle: "Open Log", action: #selector(openLog), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit IconCloak", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.menu = menu
-        item.button?.performClick(nil)
-        item.menu = nil
+        // Not `item.menu`: a menu attached to a status item is as wide as the item, and the
+        // fillers are very wide. Popped up at the item's right edge, it sizes to its content.
+        guard let button = item.button else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: button.bounds.maxX - 24, y: button.bounds.minY - 4), in: button)
     }
 
-    /// Global ⌃⌥⌘H toggles collapse (Carbon hot keys need no permissions).
+    @objc private func showSettings() { SettingsWindow.shared.show() }
+
+    /// The configurable global shortcut (Carbon hot keys need no permissions).
     private func registerHotKey() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, ctx in
-            let me = Unmanaged<AppDelegate>.fromOpaque(ctx!).takeUnretainedValue()
-            DispatchQueue.main.async { me.setCollapsed(!me.collapsed) }
-            return noErr
-        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
-        var ref: EventHotKeyRef?
-        RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | optionKey | cmdKey),
-                            EventHotKeyID(signature: OSType(0x49434C4B), id: 1), GetApplicationEventTarget(), 0, &ref)
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+        if hotKeyHandler == nil {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, ctx in
+                let me = Unmanaged<AppDelegate>.fromOpaque(ctx!).takeUnretainedValue()
+                DispatchQueue.main.async { me.setCollapsed(!me.collapsed) }
+                return noErr
+            }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
+        }
+        let shortcut = Shortcut.current
+        let status = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers,
+                                         EventHotKeyID(signature: OSType(0x49434C4B), id: 1),
+                                         GetApplicationEventTarget(), 0, &hotKeyRef)
+        log("shortcut \(shortcut.description)\(status == noErr ? "" : " could not be registered (already in use?)")")
     }
 
     // MARK: - Development controls
@@ -686,6 +661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let item = parts[0] == "toggle" ? self.toggle! : parts[0] == "filler" ? self.filler! : self.divider!
                 item.length = n < 0 ? NSStatusItem.variableLength : CGFloat(n)
                 self.log("len \(parts[0]) = \(n)")
+            case "menu": self.showMenu(on: self.collapsed ? self.toggle : self.divider)
+            case "settings": SettingsWindow.shared.show()
             case "front": self.moveDividerToFront()
             case "arrange": self.arrangeItems()
             case "collapse": self.setCollapsed(true)
@@ -770,23 +747,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleFromMenu() { setCollapsed(!collapsed) }
 
-    @objc private func toggleLaunchAtLogin() {
-        let service = SMAppService.mainApp
-        do {
-            if service.status == .enabled {
-                try service.unregister()
-            } else {
-                try service.register()
-            }
-            log("launch at login: \(service.status == .enabled)")
-        } catch {
-            log("launch at login failed: \(error)")
-            let alert = NSAlert()
-            alert.messageText = "Couldn't change Launch at Login"
-            alert.informativeText = "\(error.localizedDescription)\n\nYou can also add IconCloak in System Settings → General → Login Items."
-            alert.runModal()
-        }
-    }
     @objc private func openLog() { NSWorkspace.shared.open(logURL) }
 
     private func logState(label: String) {
