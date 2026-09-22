@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import ServiceManagement
 
 // IconCloak — hides menu bar icons on macOS 27.
 //
@@ -62,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.ensureOrder()
             self.rolesReady = true
             self.configureButtons()
+            self.scheduleAutoHide()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.moveDividerToFront() }
         }
         // Keep "»" in front: after a ⌘-drag in the menu bar, move it back if an icon ended up
@@ -135,8 +137,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         value ? startOverflowWatch() : stopOverflowWatch()
+        value ? autoHideTimer?.invalidate() : scheduleAutoHide()
         log("---- \(value ? "COLLAPSE" : "EXPAND") ----")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.logState(label: value ? "collapsed" : "expanded") }
+    }
+
+    // MARK: - Auto-hide
+
+    private static let autoHidePresets = [5, 10, 15, 30, 60]
+    private var autoHideTimer: Timer?
+
+    /// Seconds after expanding until IconCloak collapses again; nil when auto-hide is off.
+    private var autoHideDelay: Int? {
+        get {
+            let seconds = UserDefaults.standard.integer(forKey: "autoHideDelay")
+            return seconds > 0 ? seconds : nil
+        }
+        set {
+            UserDefaults.standard.set(newValue ?? 0, forKey: "autoHideDelay")
+            log("auto-hide: \(newValue.map { "\($0) s" } ?? "off")")
+            scheduleAutoHide()
+        }
+    }
+
+    private func scheduleAutoHide(after seconds: TimeInterval? = nil) {
+        autoHideTimer?.invalidate()
+        guard let delay = autoHideDelay, !collapsed else { return }
+        autoHideTimer = Timer.scheduledTimer(withTimeInterval: seconds ?? TimeInterval(delay), repeats: false) { [weak self] _ in
+            guard let self, !self.collapsed else { return }
+            // Don't pull icons away while the user is using them: wait until the pointer has
+            // left the menu bar and no menu is open.
+            if self.userIsInMenuBar() {
+                self.scheduleAutoHide(after: 1)
+            } else {
+                self.setCollapsed(true)
+            }
+        }
+    }
+
+    private func userIsInMenuBar() -> Bool {
+        let mouse = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) {
+            let menuBarHeight = max(screen.frame.maxY - screen.visibleFrame.maxY, 40)
+            if mouse.y >= screen.frame.maxY - menuBarHeight { return true }
+        }
+        // An open menu (e.g. from a hidden icon) is a pop-up menu window of its app.
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        let menuLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        return windows.contains { ($0[kCGWindowLayer as String] as? Int) == menuLevel }
+    }
+
+    @objc private func pickAutoHide(_ sender: NSMenuItem) {
+        autoHideDelay = sender.tag > 0 ? sender.tag : nil
+    }
+
+    @objc private func pickCustomAutoHide() {
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 24))
+        field.integerValue = autoHideDelay ?? 20
+        let alert = NSAlert()
+        alert.messageText = "Auto-Hide"
+        alert.informativeText = "Hide icons again after how many seconds? (1–3600)"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let seconds = field.integerValue
+        guard (1...3600).contains(seconds) else { NSSound.beep(); return }
+        autoHideDelay = seconds
+    }
+
+    private func autoHideMenu() -> NSMenu {
+        let menu = NSMenu()
+        let current = autoHideDelay
+        let off = menu.addItem(withTitle: "Off", action: #selector(pickAutoHide(_:)), keyEquivalent: "")
+        off.target = self
+        off.tag = 0
+        off.state = current == nil ? .on : .off
+        menu.addItem(.separator())
+        for seconds in Self.autoHidePresets {
+            let item = menu.addItem(withTitle: "After \(seconds) Seconds", action: #selector(pickAutoHide(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = seconds
+            item.state = current == seconds ? .on : .off
+        }
+        let isCustom = current.map { !Self.autoHidePresets.contains($0) } ?? false
+        let custom = menu.addItem(withTitle: isCustom ? "Custom (\(current!) Seconds)…" : "Custom…",
+                                  action: #selector(pickCustomAutoHide), keyEquivalent: "")
+        custom.target = self
+        custom.state = isCustom ? .on : .off
+        return menu
     }
 
     /// Fill from the notch's right edge (or the app menus' end without a notch) up to the toggle's right edge.
@@ -369,6 +460,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Hide/Show Icons  ⌃⌥⌘H", action: #selector(toggleFromMenu), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Move » to the Far Left", action: #selector(moveDividerToFront), keyEquivalent: "").target = self
         menu.addItem(.separator())
+        let autoHide = menu.addItem(withTitle: "Auto-Hide", action: nil, keyEquivalent: "")
+        autoHide.submenu = autoHideMenu()
+        let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        login.target = self
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Open Log", action: #selector(openLog), keyEquivalent: "").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit IconCloak", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -396,11 +492,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Remote control for automated testing, compiled only into dev builds
     /// (`scripts/build-app.sh --dev`). Any local process can post these notifications, and
     /// IconCloak holds the Accessibility permission, so this must never ship in a release.
-    /// Usage: `build/ctl collapse|expand|log|axdump|pressoverflow|click:x,y|cmddrag:x1,x2`.
+    /// Usage: `build/ctl collapse|expand|log|axdump|pressoverflow|click:x,y|cmddrag:x1,x2|autohide:<s>`.
     private func installDevControls() {
         DistributedNotificationCenter.default().addObserver(forName: .init("dev.iconcloak.cmd"), object: nil, queue: .main) { [weak self] note in
             guard let self, let cmd = note.object as? String else { return }
             switch cmd {
+            case let c where c.hasPrefix("autohide:"): self.autoHideDelay = Int(c.dropFirst(9)).flatMap { $0 > 0 ? $0 : nil }
             case "collapse": self.setCollapsed(true)
             case "expand": self.setCollapsed(false)
             case "log": self.logState(label: "manual")
@@ -482,6 +579,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Diagnostics
 
     @objc private func toggleFromMenu() { setCollapsed(!collapsed) }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+            log("launch at login: \(service.status == .enabled)")
+        } catch {
+            log("launch at login failed: \(error)")
+            let alert = NSAlert()
+            alert.messageText = "Couldn't change Launch at Login"
+            alert.informativeText = "\(error.localizedDescription)\n\nYou can also add IconCloak in System Settings → General → Login Items."
+            alert.runModal()
+        }
+    }
     @objc private func openLog() { NSWorkspace.shared.open(logURL) }
 
     private func logState(label: String) {

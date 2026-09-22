@@ -15,13 +15,34 @@ Hide menu bar icons on macOS 27. A small, open-source take on
 - **Expand:** click `«` (or press **⌃⌥⌘H** again) and they come back.
 - **Choose what to hide:** when expanded, IconCloak shows `»` on the left and a `|` marker.
   The icons between them get hidden. Hold **⌘** and drag icons in or out.
+- **Auto-hide (optional):** hide the icons again a set number of seconds after expanding.
+  It waits while your pointer is on the menu bar or a menu is open.
 - **Stays hidden when you switch apps.** IconCloak adapts to each app's menus, so hidden
   icons don't reappear next to short menus like Finder's.
 
 ## Install
 
-There's no signed download yet, so build it from source. You need macOS 27 and the Xcode
-Command Line Tools (`xcode-select --install`).
+The [install guide](docs/install.md) has step-by-step instructions, updating, uninstalling
+and troubleshooting. The short version:
+
+### Download
+
+1. Download `IconCloak-<version>.zip` from the
+   [latest release](https://github.com/LarsAtassi/icon-cloak/releases/latest) and unzip it.
+2. Move **IconCloak.app** to your **Applications** folder.
+3. Open it. IconCloak isn't notarized by Apple (that needs a paid developer account), so
+   macOS blocks it the first time. Go to **System Settings → Privacy & Security**, scroll
+   down and click **Open Anyway**.
+4. Grant **Accessibility** when asked: System Settings → Privacy & Security →
+   Accessibility → IconCloak. IconCloak picks it up within a couple of seconds.
+5. Optional: right-click `»` → **Launch at Login**.
+
+Every release is signed with the same certificate, so the Accessibility permission carries
+over when you update. Just replace the app in Applications.
+
+### Build from source
+
+You need macOS 27 and the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
 git clone https://github.com/LarsAtassi/icon-cloak.git
@@ -48,7 +69,8 @@ every time you rebuild. You can delete the certificate anytime in Keychain Acces
 | Hide icons | Click `»`, or ⌃⌥⌘H |
 | Show icons | Click `«`, or ⌃⌥⌘H |
 | Choose which icons hide | Hold ⌘ and drag icons between `»` and `\|` |
-| Menu (move `»` to the far left, open log, quit) | Right-click `»` |
+| Auto-hide after 5–60 seconds, or a custom time | Right-click `»` → Auto-Hide |
+| Menu (launch at login, move `»` to the far left, open log, quit) | Right-click `»` |
 
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
 moves `»` back in front, so that icon joins the hidden ones. It does this with a quick
@@ -79,7 +101,7 @@ The full write-up, including what didn't work, is in [docs/how-it-works.md](docs
 - Only tested on a built-in notched display. External displays, multiple displays and
   Macs without a notch haven't been tested.
 - The keyboard shortcut is fixed to ⌃⌥⌘H.
-- No launch at login, auto-hide or settings window yet.
+- No settings window yet. Everything is in the right-click menu.
 - It relies on how macOS 27 lays out the menu bar, which isn't a public API. A macOS update
   may break it.
 
@@ -92,6 +114,12 @@ build/ctl collapse                     # also: expand, log, axdump, pressoverflo
 
 Dev builds accept commands from any local process, and IconCloak has the Accessibility
 permission. **Don't use `--dev` builds day to day or distribute them.**
+
+To make a release, bump `CFBundleShortVersionString` in `scripts/build-app.sh`, then run
+`scripts/release.sh`. It builds `build/IconCloak-<version>.zip` plus a checksum and refuses to
+package dev builds or builds not signed with the "IconCloak Dev" certificate. Always sign
+releases with the same certificate, so users keep their Accessibility permission when they
+update.
 
 The code is in [Sources/IconCloak/main.swift](Sources/IconCloak/main.swift). Issues and
 pull requests are welcome, especially reports from setups other than a notched MacBook.
