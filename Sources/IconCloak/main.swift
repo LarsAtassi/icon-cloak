@@ -159,6 +159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Collapse / expand
 
     @objc private func itemClicked(_ sender: NSStatusBarButton) {
+        // While collapsed, the fillers cover most of the menu bar (even around the notch). Only
+        // our own "«" at the right end of the toggle filler reacts; the rest is dead space.
+        if collapsed && sender !== divider.button && !clickIsOnOwnExpandButton() { return }
         if NSApp.currentEvent?.type == .rightMouseUp {
             showMenu(on: [toggle, divider, filler].first { $0.button === sender } ?? toggle)
         } else if sender === toggle.button && !collapsed {
@@ -166,6 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             setCollapsed(!collapsed)
         }
+    }
+
+    /// Whether the current click is on the "«" drawn at the right end of the toggle filler.
+    private func clickIsOnOwnExpandButton() -> Bool {
+        guard ownExpandButton, let inset = toggleRightInset, let screen = screenWithPointer() else { return false }
+        let toggleRight = screen.frame.maxX - inset
+        let x = NSEvent.mouseLocation.x
+        return x >= toggleRight - 36 && x <= toggleRight + 4
     }
 
     private func setCollapsed(_ value: Bool) {
@@ -392,7 +403,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
             if type == .leftMouseDown, me.collapsed,
-               me.overflowButtonFrames.contains(where: { $0.insetBy(dx: -4, dy: 0).contains(event.location) }) {
+               me.overflowButtonFrames.contains(where: { $0.insetBy(dx: -4, dy: 0).contains(event.location) }),
+               !me.isCoveredByAnotherApp(event.location) {
                 me.swallowNextMouseUp = true
                 DispatchQueue.main.async { me.setCollapsed(false) }
                 return nil
@@ -401,6 +413,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }, userInfo: Unmanaged.passUnretained(self).toOpaque())
         guard let clickTap else { log("click tap unavailable (accessibility?)"); return }
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, clickTap, 0), .commonModes)
+    }
+
+    /// Whether another app's window sits above the menu bar at `point` (e.g. an app drawing a
+    /// fake notch over the middle of the menu bar). Clicks there belong to that app.
+    private func isCoveredByAnotherApp(_ point: CGPoint) -> Bool {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        let menuBarLevel = Int(CGWindowLevelForKey(.statusWindow))
+        let ignored: Set<String> = ["IconCloak", "MenuBarAgent", "Window Server"]
+        return windows.contains { window in
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer > menuBarLevel,
+                  let owner = window[kCGWindowOwnerName as String] as? String, !ignored.contains(owner),
+                  let bounds = window[kCGWindowBounds as String] as? [String: CGFloat],
+                  let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return false }
+            return rect.contains(point)
+        }
     }
 
     /// macOS's overflow buttons, one per display's menu bar: the AXButtons directly inside
