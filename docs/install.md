@@ -160,6 +160,18 @@ Right-click `»` → **Move » to the Far Left**. This needs the Accessibility p
 Everything between `»` and `|` gets hidden. Expand with `«`, then hold **⌘** and drag icons
 into or out of that area.
 
+### There are two `«` buttons (external display)
+
+On displays without a notch, macOS puts its own `«` near the middle of the menu bar, so
+IconCloak adds one next to your visible icons. Both show the hidden icons. (If an app draws a
+fake notch in the middle of the screen, it may cover macOS's one.)
+
+### Hiding doesn't work on one of my displays
+
+IconCloak sets up hiding for the display your pointer is on. Move the pointer onto that
+display and hide the icons again. If hiding fails, IconCloak shows the icons again right away
+and pauses auto-hide until the next successful hide.
+
 ### ⌃⌥⌘H doesn't do anything
 
 Another app may already use that shortcut. Clicking `»` and `«` still works. A custom

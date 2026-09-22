@@ -100,8 +100,11 @@ The full write-up, including what didn't work, is in [docs/how-it-works.md](docs
 
 ## Limitations
 
-- Only tested on a built-in notched display. External displays, multiple displays and
-  Macs without a notch haven't been tested.
+- Tested on a MacBook with a notch and on external displays without one. With several
+  displays, hiding is set up for the display your pointer is on, and adjusts when you move
+  to another one.
+- On displays without a notch, macOS puts its `«` near the middle of the menu bar, so
+  IconCloak adds its own `«` next to your visible icons.
 - The keyboard shortcut is fixed to ⌃⌥⌘H.
 - No settings window yet. Everything is in the right-click menu.
 - It relies on how macOS 27 lays out the menu bar, which isn't a public API. A macOS update

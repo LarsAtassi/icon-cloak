@@ -6,32 +6,61 @@ import ServiceManagement
 // IconCloak — hides menu bar icons on macOS 27.
 //
 // Expanded:   [app menus]  (notch)  [» divider] [hidden icons] [| toggle] [visible icons]
-// Collapsed:  [app menus][divider filler] (notch) [toggle filler] [«] [visible icons]
+// Collapsed:  [app menus][filler] (notch) [toggle filler] [«] [visible icons]
 //
 // "»" collapses, "|" marks the boundary: everything left of it gets hidden. macOS 27 places
-// status items right of the notch first, then left of it after the app menus, and only
-// then in its own "«" overflow. When collapsing, the toggle fills the free space right of
-// the notch and the divider (pushed to the left side) fills the space after the app menus,
-// so the icons left of the toggle fit nowhere and end up in the overflow. The left filler is resized whenever the frontmost app changes, which
-// needs the Accessibility permission to read where the app menus end.
+// status items right of the notch first, then left of it (filling from the notch outwards),
+// and only then in its own "«" overflow. Displays without a notch behave as if they had a
+// zero-width notch in the middle. When collapsing, the toggle fills the free space right of
+// the notch, and a third, otherwise hidden item directly left of it (the filler) fills the
+// space left of the notch up to the app menus — so the icons left of it fit nowhere and end
+// up in the overflow. The filler is resized whenever the frontmost app or display changes,
+// which needs the Accessibility permission to read where the app menus end.
 // See docs/how-it-works.md for the details.
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var toggle: NSStatusItem!
-    private var divider: NSStatusItem!
+    private enum Label {
+        static let divider = "IconCloak: hide icons"
+        static let toggle = "IconCloak: boundary"
+        static let filler = "IconCloak: filler"
+    }
+    private var toggle: NSStatusItem!   // "|": the boundary; right filler while collapsed
+    private var divider: NSStatusItem!  // "»": the collapse button, far left
+    /// Left filler while collapsed. Must sit directly left of the toggle: the space left of the
+    /// notch fills from the notch outwards, so it has to come before the icons it pushes out.
+    /// Hidden while expanded (a zero-length item would still leave a gap).
+    private var filler: NSStatusItem!
+    /// True while IconCloak rearranges its items with simulated ⌘-drags.
+    private var arranging = false
     private var collapsed = false
 
     /// Status item windows are this much wider than `length` (button padding).
     private let itemPadding: CGFloat = 16
     private let margin: CGFloat = 8
 
-    /// Toggle frame measured while expanded; its right edge stays put when collapsed.
-    private var expandedToggleFrame: NSRect?
+    /// Distance from the toggle's right edge to its screen's right edge, measured while expanded.
+    /// Status items sit at the same distance from the right on every display's menu bar, so this
+    /// locates the toggle on any display.
+    private var toggleRightInset: CGFloat?
+    /// Every display has its own menu bar, but an item has one width for all of them, so the
+    /// fillers are sized for the display the user is on (the one with the pointer).
+    private var fillerScreen: NSScreen?
+    private var screenWatch: Timer?
 
     /// Watches macOS's overflow button while collapsed: clicking it ("«" → "»") expands IconCloak.
     private var overflowWatch: Timer?
     private var overflowBaseline: String?
     private var glyphsHidden = false
+    /// Draw our own "«" at the right end of the toggle filler, next to the visible icons. Only
+    /// needed when macOS's "«" ends up far from them (on displays without a notch it sits near
+    /// the center, where apps drawing a fake notch can even cover it).
+    private var ownExpandButton = false
+    private let expandImage: NSImage? = {
+        let image = NSImage(systemSymbolName: "chevron.left.2", accessibilityDescription: "Show menu bar icons")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+        image?.isTemplate = true
+        return image
+    }()
     /// Roles are assigned by position once macOS has laid out both items.
     private var rolesReady = false
     private let collapseImage: NSImage? = {
@@ -42,8 +71,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
     /// Same size as `collapseImage`, fully transparent.
     private lazy var clearCollapseImage: NSImage? = collapseImage.map { NSImage(size: $0.size) }
-    /// Frame of macOS's overflow button (global top-left coords), refreshed while collapsed.
-    private var overflowButtonFrame: CGRect?
+    /// Frames of macOS's overflow buttons, one per display (global top-left coords), refreshed
+    /// while collapsed.
+    private var overflowButtonFrames: [CGRect] = []
     private var clickTap: CFMachPort?
     private var swallowNextMouseUp = false
 
@@ -54,29 +84,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.autosaveName = "IconCloak.toggle"
         divider = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         divider.autosaveName = "IconCloak.divider"
+        filler = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        filler.autosaveName = "IconCloak.filler"
         configureButtons()
         registerHotKey()
         // Frames are only valid once macOS has laid the items out.
         toggle.isVisible = true
         divider.isVisible = true
+        filler.isVisible = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.ensureOrder()
             self.rolesReady = true
-            self.configureButtons()
             self.scheduleAutoHide()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.moveDividerToFront() }
+            self.arrangeItems()
         }
-        // Keep "»" in front: after a ⌘-drag in the menu bar, move it back if an icon ended up
-        // left of it (global mouse monitors need Accessibility).
+        // Keep the arrangement after the user ⌘-drags something in the menu bar: "»" back in
+        // front, the filler next to "|" (global mouse monitors need Accessibility).
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
             guard let self, !self.collapsed, event.modifierFlags.contains(.command),
-                  let screen = NSScreen.main, NSEvent.mouseLocation.y > screen.frame.maxY - 40 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.moveDividerToFront() }
+                  let screen = self.screenWithPointer(), NSEvent.mouseLocation.y > screen.frame.maxY - 40 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.arrangeItems() }
         }
 
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.updateLeftFiller() }
+        ) { [weak self] _ in self?.updateFillers() }
+        // Displays connected, disconnected or rearranged, or their resolution changed.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.log("screen parameters changed: \(NSScreen.screens.map { "\($0.localizedName) \($0.frame)" })")
+            self.fillerScreen = nil
+            self.autoHideSuspended = false
+            self.updateFillers()
+        }
 
         if let size = try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int, size > 1_000_000 {
             try? FileManager.default.removeItem(at: logURL)
@@ -93,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 self.log("accessibility granted")
                 self.installClickTap()
-                self.updateLeftFiller()
+                self.updateFillers()
             }
         }
 
@@ -106,7 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func itemClicked(_ sender: NSStatusBarButton) {
         if NSApp.currentEvent?.type == .rightMouseUp {
-            showMenu(on: [toggle, divider].first { $0.button === sender } ?? toggle)
+            showMenu(on: [toggle, divider, filler].first { $0.button === sender } ?? toggle)
         } else if sender === toggle.button && !collapsed {
             return // "|" is only a boundary marker
         } else {
@@ -115,14 +157,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setCollapsed(_ value: Bool) {
-        guard value != collapsed, rolesReady else { return }
-        if value { expandedToggleFrame = toggle.button?.window?.frame }
+        guard value != collapsed, rolesReady, !arranging else { return }
+        if value, let screen = screenWithPointer(), let frame = itemFrame(Label.toggle, on: screen) {
+            toggleRightInset = screen.frame.maxX - frame.maxX
+        } else if value, let frame = toggle.button?.window?.frame,
+                  let screen = NSScreen.screens.first(where: { $0.frame.minX <= frame.midX && frame.midX < $0.frame.maxX }) {
+            toggleRightInset = screen.frame.maxX - frame.maxX
+        }
         collapsed = value
         if value {
-            toggle.length = rightFillerLength()
-            updateLeftFiller()
+            fillerScreen = nil
+            filler.isVisible = true
+            updateFillers()
+            startScreenWatch()
+            verifyCollapse()
         } else {
-            divider.length = NSStatusItem.variableLength
+            screenWatch?.invalidate()
+            ownExpandButton = false
+            filler.length = NSStatusItem.variableLength
         }
         if value {
             configureButtons()
@@ -146,6 +198,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let autoHidePresets = [5, 10, 15, 30, 60]
     private var autoHideTimer: Timer?
+    /// Set when a collapse fails, so auto-hide doesn't retry every few seconds. Cleared by the
+    /// next successful collapse or a display change.
+    private var autoHideSuspended = false
 
     /// Seconds after expanding until IconCloak collapses again; nil when auto-hide is off.
     private var autoHideDelay: Int? {
@@ -162,7 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleAutoHide(after seconds: TimeInterval? = nil) {
         autoHideTimer?.invalidate()
-        guard let delay = autoHideDelay, !collapsed else { return }
+        guard let delay = autoHideDelay, !collapsed, !autoHideSuspended else { return }
         autoHideTimer = Timer.scheduledTimer(withTimeInterval: seconds ?? TimeInterval(delay), repeats: false) { [weak self] _ in
             guard let self, !self.collapsed else { return }
             // Don't pull icons away while the user is using them: wait until the pointer has
@@ -230,52 +285,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    /// Fill from the notch's right edge (or the app menus' end without a notch) up to the toggle's right edge.
-    private func rightFillerLength() -> CGFloat {
-        guard let frame = expandedToggleFrame, let screen = toggle.button?.window?.screen else { return 0 }
-        let start = screen.auxiliaryTopRightArea?.minX ?? appMenusEndX(on: screen) ?? frame.minX
-        let length = frame.maxX - start - margin - itemPadding
-        log("right filler: toggleMaxX=\(frame.maxX) start=\(start) → \(length)")
-        return max(length, 0)
-    }
+    // MARK: - Fillers
 
-    /// Fill the space between the frontmost app's menus and the notch's left edge.
-    private func updateLeftFiller() {
-        guard collapsed, let screen = toggle.button?.window?.screen ?? NSScreen.main else { return }
-        guard let notchLeft = screen.auxiliaryTopLeftArea?.maxX else {
-            divider.length = 0 // No notch: the right filler already spans the whole bar.
+    /// Sizes the fillers for the display the pointer is on: the toggle fills the space right of
+    /// the notch and the filler (pushed to the left side) the space between the app menus and
+    /// the notch, so the icons left of them fit nowhere and go into macOS's overflow.
+    ///
+    /// Displays without a notch behave as if they had a zero-width notch in the middle: status
+    /// items fill the right half first, then continue left of the center, and a single item can
+    /// be at most half the display wide (a wider one is dropped). So the center is used as the notch.
+    private func updateFillers() {
+        guard collapsed else { return }
+        guard let inset = toggleRightInset, let screen = screenWithPointer() else {
+            log("fillers: no toggle position (inset=\(String(describing: toggleRightInset)), frame=\(String(describing: toggle.button?.window?.frame)))")
             return
         }
-        guard let menusEnd = appMenusEndX(on: screen) else {
-            log("left filler: can't read app menus (accessibility not granted?)")
+        guard let menusWidth = appMenusWidth() else {
+            log("fillers: can't read app menus (accessibility not granted?)")
             return
         }
-        let length = max(notchLeft - menusEnd - margin - itemPadding, 0)
-        divider.length = length
-        log("left filler: menusEnd=\(menusEnd) notchLeft=\(notchLeft) → \(length)")
+        let toggleRight = screen.frame.maxX - inset
+        let menusEnd = screen.frame.minX + menusWidth
+        let notchLeft = screen.auxiliaryTopLeftArea?.maxX ?? screen.frame.midX
+        let notchRight = screen.auxiliaryTopRightArea?.minX ?? screen.frame.midX
+        let toggleLength = toggleRight - notchRight - margin - itemPadding
+        let fillerLength = notchLeft - menusEnd - margin - itemPadding
+        fillerScreen = screen
+        if toggle.length != max(toggleLength, 0) {
+            toggle.length = max(toggleLength, 0)
+            if ownExpandButton { configureButtons() } // the "«" image is as wide as the filler
+        }
+        if filler.length != max(fillerLength, 0) { filler.length = max(fillerLength, 0) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.updateOwnExpandButton() }
+        log("fillers for \(screen.localizedName) \(Int(screen.frame.width)) pt\(screen.auxiliaryTopLeftArea != nil ? ", notch" : ""): "
+            + "menus end at \(Int(menusWidth)), toggle \(Int(toggleLength)), filler \(Int(fillerLength))")
     }
 
-    /// Right edge (screen x) of the frontmost app's menu bar items, via Accessibility.
-    private func appMenusEndX(on screen: NSScreen) -> CGFloat? {
+    /// While collapsed, re-size the fillers when the pointer moves to another display.
+    private func startScreenWatch() {
+        screenWatch?.invalidate()
+        screenWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, self.collapsed, let screen = self.screenWithPointer(), screen != self.fillerScreen else { return }
+            self.updateFillers()
+        }
+    }
+
+    /// Safety net: if macOS didn't move anything into its overflow (e.g. a filler didn't fit and
+    /// was dropped), there'd be no "«" to click and no "»" either — so expand again.
+    private func verifyCollapse() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.collapsed, AXIsProcessTrusted(), let screen = self.screenWithPointer() else { return }
+            let onScreen = self.overflowButtons().contains {
+                $0.frame.midX >= screen.frame.minX && $0.frame.midX < screen.frame.maxX
+            }
+            guard !onScreen else {
+                self.autoHideSuspended = false
+                self.updateOwnExpandButton()
+                return
+            }
+            self.log("collapse failed (no overflow button): expanding again, auto-hide paused")
+            self.autoHideSuspended = true
+            self.setCollapsed(false)
+        }
+    }
+
+    /// Shows our own "«" when macOS's is not right next to the visible icons on this display.
+    private func updateOwnExpandButton() {
+        guard collapsed, let inset = toggleRightInset, let screen = screenWithPointer() else { return }
+        let toggleRight = screen.frame.maxX - inset
+        let system = overflowButtons().map(\.frame).filter { $0.midX >= screen.frame.minX && $0.midX < screen.frame.maxX }
+        let adjacent = system.contains { toggleRight - $0.maxX < 48 && toggleRight - $0.maxX > -48 }
+        guard ownExpandButton == adjacent else { return } // already right
+        ownExpandButton = !adjacent
+        log("own « button: \(ownExpandButton ? "shown" : "hidden") (macOS's at \(system.map { Int($0.minX) }), toggle ends at \(Int(toggleRight)))")
+        configureButtons()
+    }
+
+    private func screenWithPointer() -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+    }
+
+    /// Width of the frontmost app's menus (Apple menu to the last menu), via Accessibility.
+    /// The same on every display's menu bar.
+    private func appMenusWidth() -> CGFloat? {
         guard AXIsProcessTrusted(), let app = NSWorkspace.shared.menuBarOwningApplication else { return nil }
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var menuBar: CFTypeRef?
         guard AXUIElementCopyAttributeValue(axApp, kAXMenuBarAttribute as CFString, &menuBar) == .success else { return nil }
-        var children: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(menuBar as! AXUIElement, kAXChildrenAttribute as CFString, &children) == .success,
-              let items = children as? [AXUIElement] else { return nil }
-        var maxX: CGFloat = screen.frame.minX
-        for item in items {
-            var posValue: CFTypeRef?, sizeValue: CFTypeRef?
-            var pos = CGPoint.zero, size = CGSize.zero
-            AXUIElementCopyAttributeValue(item, kAXPositionAttribute as CFString, &posValue)
-            AXUIElementCopyAttributeValue(item, kAXSizeAttribute as CFString, &sizeValue)
-            if let posValue { AXValueGetValue(posValue as! AXValue, .cgPoint, &pos) }
-            if let sizeValue { AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) }
-            // Only items on this screen's menu bar (AX uses the same x axis as AppKit).
-            if pos.x >= screen.frame.minX, pos.x < screen.frame.maxX { maxX = max(maxX, pos.x + size.width) }
-        }
-        return maxX
+        let frames = axChildren(menuBar as! AXUIElement).map { axFrame($0) }.filter { $0.width > 0 }
+        guard let first = frames.min(by: { $0.minX < $1.minX }), let last = frames.max(by: { $0.maxX < $1.maxX }) else { return nil }
+        // The Apple menu starts at its display's left edge.
+        let displayLeft = NSScreen.screens.first { $0.frame.minX <= first.midX && first.midX < $0.frame.maxX }?.frame.minX ?? first.minX
+        return last.maxX - displayLeft
     }
 
     // MARK: - Overflow button
@@ -287,10 +389,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overflowBaseline = nil
         overflowWatch?.invalidate()
         overflowWatch = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self, self.collapsed, let (label, frame) = self.overflowButton() else { return }
-            self.overflowButtonFrame = frame
-            guard let baseline = self.overflowBaseline else { self.overflowBaseline = label; return }
-            if label != baseline {
+            guard let self, self.collapsed else { return }
+            let buttons = self.overflowButtons()
+            self.overflowButtonFrames = buttons.map(\.frame)
+            guard let first = buttons.first else { return }
+            guard let baseline = self.overflowBaseline else { self.overflowBaseline = first.label; return }
+            if let label = buttons.first(where: { $0.label != baseline })?.label {
                 self.log("overflow button changed (\(baseline) → \(label)): expanding")
                 self.setCollapsed(false)
             }
@@ -300,7 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func stopOverflowWatch() {
         overflowWatch?.invalidate()
         overflowWatch = nil
-        overflowButtonFrame = nil
+        overflowButtonFrames = []
     }
 
     /// Catches clicks on the overflow button while collapsed and expands IconCloak instead,
@@ -318,8 +422,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 me.swallowNextMouseUp = false
                 return nil
             }
-            if type == .leftMouseDown, me.collapsed, let frame = me.overflowButtonFrame,
-               frame.insetBy(dx: -4, dy: 0).contains(event.location) {
+            if type == .leftMouseDown, me.collapsed,
+               me.overflowButtonFrames.contains(where: { $0.insetBy(dx: -4, dy: 0).contains(event.location) }) {
                 me.swallowNextMouseUp = true
                 DispatchQueue.main.async { me.setCollapsed(false) }
                 return nil
@@ -330,20 +434,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, clickTap, 0), .commonModes)
     }
 
-    /// The overflow button: the action-less AXButton inside MenuBarAgent's "Menu Extras" menu bar.
-    /// Returns its label and frame (global top-left coordinates).
-    private func overflowButton() -> (String, CGRect)? {
+    /// macOS's overflow buttons, one per display's menu bar: the AXButtons directly inside
+    /// MenuBarAgent's windows (status items are nested one level deeper). Label and frame
+    /// (global top-left coordinates).
+    private func overflowButtons() -> [(label: String, frame: CGRect)] {
         guard let agent = NSWorkspace.shared.runningApplications.first(where: {
             $0.executableURL?.lastPathComponent == "MenuBarAgent"
-        }) else { return nil }
+        }) else { return [] }
         let app = AXUIElementCreateApplication(agent.processIdentifier)
-        for bar in axChildren(app) where axString(bar, kAXRoleAttribute) == kAXMenuBarRole {
-            for el in axChildren(bar) where axString(el, kAXRoleAttribute) == kAXButtonRole {
+        var result: [(label: String, frame: CGRect)] = []
+        for window in axChildren(app) where axString(window, kAXRoleAttribute) == kAXWindowRole {
+            for el in axChildren(window) where axString(el, kAXRoleAttribute) == kAXButtonRole {
                 let label = (axString(el, kAXTitleAttribute) ?? "") + (axString(el, kAXDescriptionAttribute) ?? "")
-                if !label.isEmpty { return (label, axFrame(el)) }
+                if !label.isEmpty { result.append((label, axFrame(el))) }
             }
         }
-        return nil
+        return result
     }
 
     private func axFrame(_ el: AXUIElement) -> CGRect {
@@ -368,42 +474,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return v as? String
     }
 
-    // MARK: - Moving "»" to the front
+    // MARK: - Arranging the items
+
+    /// Item positions are owned by MenuBarAgent and can't be set through an API, so IconCloak
+    /// arranges its items with simulated ⌘-drags (needs Accessibility) and puts the cursor back:
+    /// the filler directly left of "|", then "»" in front of the leftmost icon.
+    @objc private func arrangeItems() {
+        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer() else { return }
+        arranging = true
+        filler.length = NSStatusItem.variableLength
+        filler.isVisible = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+            let done = { [self] in
+                arranging = false
+                configureButtons() // hides the filler again
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.moveDividerToFront() }
+            }
+            guard let f = itemFrame(Label.filler, on: screen), let t = itemFrame(Label.toggle, on: screen),
+                  abs(f.maxX - t.minX) > 3 else { return done() }
+            // Dropping onto the left part of "|" inserts before it; approaching from the left,
+            // stop just short of it.
+            let target = f.midX < t.minX ? t.minX - 4 : t.minX + 3
+            log("moving filler next to | (x=\(Int(f.midX)) → \(Int(target)))")
+            drag(from: f.midX, to: target, on: screen) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { done() }
+            }
+        }
+    }
 
     /// ⌘-drags "»" in front of the leftmost menu bar icon, so all icons between it and "|" are
-    /// the hidden section. Item positions are owned by MenuBarAgent and can't be set through
-    /// an API, so this simulates the drag (needs Accessibility) and puts the cursor back.
+    /// the hidden section.
     @objc private func moveDividerToFront() {
-        guard !collapsed, AXIsProcessTrusted(),
-              let screen = divider.button?.window?.screen,
-              let dividerFrame = divider.button?.window?.frame,
-              let notchRight = screen.auxiliaryTopRightArea?.minX ?? Optional(screen.frame.minX),
-              let leftmost = menuBarItemFrames().filter({ $0.minX >= notchRight }).min(by: { $0.minX < $1.minX })
+        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer(),
+              let dividerFrame = itemFrame(Label.divider, on: screen)
+        else { return }
+        // Only this display's menu bar (every display has one), right of the notch if there is one.
+        let start = screen.auxiliaryTopRightArea?.minX ?? screen.frame.minX
+        guard let leftmost = menuBarItemFrames()
+            .filter({ $0.minX >= start && $0.maxX <= screen.frame.maxX })
+            .min(by: { $0.minX < $1.minX })
         else { return }
         guard dividerFrame.minX > leftmost.minX + 2 else { return } // already in front
+        log("moving » from x=\(Int(dividerFrame.midX)) to x=\(Int(leftmost.minX + 3))")
+        drag(from: dividerFrame.midX, to: leftmost.minX + 3, on: screen)
+    }
 
-        // AppKit and CoreGraphics share the x axis; y is the menu bar's vertical center.
-        let y = screen.frame.maxY - (NSScreen.screens.first?.frame.maxY ?? screen.frame.maxY) + leftmost.midY
-        let from = CGPoint(x: dividerFrame.midX, y: y)
-        let to = CGPoint(x: leftmost.minX + 3, y: y)
+    /// Where one of IconCloak's items actually is on `screen`'s menu bar (global top-left
+    /// coordinates), found by its accessibility label in MenuBarAgent's tree.
+    private func itemFrame(_ label: String, on screen: NSScreen) -> CGRect? {
+        guard let agent = NSWorkspace.shared.runningApplications.first(where: {
+            $0.executableURL?.lastPathComponent == "MenuBarAgent"
+        }) else { return nil }
+        let app = AXUIElementCreateApplication(agent.processIdentifier)
+        for window in axChildren(app) where axString(window, kAXRoleAttribute) == kAXWindowRole {
+            for container in axChildren(window) {
+                let frame = axFrame(container)
+                guard frame.midX >= screen.frame.minX, frame.midX < screen.frame.maxX else { continue }
+                let labels = axChildren(container).map {
+                    (axString($0, kAXDescriptionAttribute) ?? "") + (axString($0, kAXTitleAttribute) ?? "")
+                }
+                if labels.contains(where: { $0.contains(label) }) { return frame }
+            }
+        }
+        return nil
+    }
+
+    /// Simulates a ⌘-drag along the menu bar of `screen`, then restores the cursor.
+    private func drag(from x0: CGFloat, to x1: CGFloat, on screen: NSScreen?, completion: (() -> Void)? = nil) {
+        guard let screen, let primary = NSScreen.screens.first else { completion?(); return }
+        // CoreGraphics uses top-left coordinates from the primary display; x is shared with AppKit.
+        let y = primary.frame.maxY - screen.frame.maxY + 12
         let restore = CGEvent(source: nil)?.location
-        log("moving » from x=\(Int(from.x)) to x=\(Int(to.x))")
-
-        func post(_ type: CGEventType, _ point: CGPoint) {
-            let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)
+        func post(_ type: CGEventType, _ x: CGFloat) {
+            let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left)
             e?.flags = .maskCommand
             e?.post(tap: .cghidEventTap)
         }
-        post(.leftMouseDown, from)
+        post(.leftMouseDown, x0)
         let steps = 12
         for i in 1...steps {
-            let t = CGFloat(i) / CGFloat(steps)
-            let p = CGPoint(x: from.x + (to.x - from.x) * t, y: y)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(i)) { post(.leftMouseDragged, p) }
+            let x = x0 + (x1 - x0) * CGFloat(i) / CGFloat(steps)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(i)) { post(.leftMouseDragged, x) }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(steps + 3)) {
-            post(.leftMouseUp, to)
+            post(.leftMouseUp, x1)
             if let restore { CGWarpMouseCursorPosition(restore) }
+            completion?()
         }
     }
 
@@ -423,27 +579,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Items
 
     private func configureButtons() {
-        for item in [toggle!, divider!] {
+        // Labels make the items findable in MenuBarAgent's accessibility tree, which (unlike the
+        // items' own window frames) reflects where they actually are.
+        toggle.button?.setAccessibilityLabel(Label.toggle)
+        divider.button?.setAccessibilityLabel(Label.divider)
+        filler.button?.setAccessibilityLabel(Label.filler)
+        for item in [toggle!, divider!, filler!] {
             item.button?.target = self
             item.button?.action = #selector(itemClicked)
             item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         // "»" (a double chevron mirroring macOS's own "«"/"»") collapses; "|" marks the right
-        // edge of the hidden section. Collapsed, both are empty fillers.
+        // edge of the hidden section. Collapsed, "|" and the filler are empty fillers, and "»"
+        // goes into the overflow with the hidden icons.
         // While macOS animates the expand, the glyphs are drawn transparent: they already take
         // their final width (so nothing shifts when they appear) but don't slide in visibly.
         divider.button?.title = ""
         divider.button?.image = collapsed ? nil : (glyphsHidden ? clearCollapseImage : collapseImage)
         divider.button?.appearsDisabled = false
         toggle.button?.image = nil
-        toggle.button?.attributedTitle = NSAttributedString(string: collapsed ? "" : "|", attributes: [
-            .foregroundColor: glyphsHidden ? NSColor.clear : NSColor.tertiaryLabelColor,
-            .font: NSFont.menuBarFont(ofSize: 0),
-        ])
-        toggle.button?.appearsDisabled = true
+        if collapsed && ownExpandButton, let expandImage {
+            // macOS centers a status item's content, so draw "«" at the right edge of an image
+            // as wide as the filler: it then sits next to the visible icons.
+            let width = max(toggle.length, expandImage.size.width)
+            let image = NSImage(size: NSSize(width: width, height: expandImage.size.height), flipped: false) { rect in
+                expandImage.draw(in: NSRect(x: rect.maxX - expandImage.size.width - 2, y: 0,
+                                            width: expandImage.size.width, height: expandImage.size.height))
+                return true
+            }
+            image.isTemplate = true
+            toggle.button?.attributedTitle = NSAttributedString(string: "")
+            toggle.button?.image = image
+            toggle.button?.appearsDisabled = false
+        } else {
+            toggle.button?.image = nil
+            toggle.button?.attributedTitle = NSAttributedString(string: collapsed ? "" : "|", attributes: [
+                .foregroundColor: glyphsHidden ? NSColor.clear : NSColor.tertiaryLabelColor,
+                .font: NSFont.menuBarFont(ofSize: 0),
+            ])
+            toggle.button?.appearsDisabled = true
+        }
+        filler.button?.title = ""
+        filler.button?.image = nil
         if !collapsed {
             toggle.length = NSStatusItem.variableLength
             if divider.length != NSStatusItem.variableLength { divider.length = NSStatusItem.variableLength }
+            if rolesReady && !arranging { filler.isVisible = false }
         }
     }
 
@@ -458,7 +639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showMenu(on item: NSStatusItem) {
         let menu = NSMenu()
         menu.addItem(withTitle: "Hide/Show Icons  ⌃⌥⌘H", action: #selector(toggleFromMenu), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Move » to the Far Left", action: #selector(moveDividerToFront), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Move » to the Far Left", action: #selector(arrangeItems), keyEquivalent: "").target = self
         menu.addItem(.separator())
         let autoHide = menu.addItem(withTitle: "Auto-Hide", action: nil, keyEquivalent: "")
         autoHide.submenu = autoHideMenu()
@@ -498,6 +679,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, let cmd = note.object as? String else { return }
             switch cmd {
             case let c where c.hasPrefix("autohide:"): self.autoHideDelay = Int(c.dropFirst(9)).flatMap { $0 > 0 ? $0 : nil }
+            case let c where c.hasPrefix("len:"):
+                // "len:toggle,N" / "len:divider,N" — sets an item's length directly (N < 0: variable).
+                let parts = c.dropFirst(4).split(separator: ",")
+                guard parts.count == 2, let n = Double(parts[1]) else { return }
+                let item = parts[0] == "toggle" ? self.toggle! : parts[0] == "filler" ? self.filler! : self.divider!
+                item.length = n < 0 ? NSStatusItem.variableLength : CGFloat(n)
+                self.log("len \(parts[0]) = \(n)")
+            case "front": self.moveDividerToFront()
+            case "arrange": self.arrangeItems()
             case "collapse": self.setCollapsed(true)
             case "expand": self.setCollapsed(false)
             case "log": self.logState(label: "manual")
@@ -603,6 +793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screen = toggle.button?.window?.screen
         log("[\(label)] notchLeft=\(screen?.auxiliaryTopLeftArea?.maxX ?? -1) notchRight=\(screen?.auxiliaryTopRightArea?.minX ?? -1) frontmost=\(NSWorkspace.shared.menuBarOwningApplication?.localizedName ?? "?")")
         log("[\(label)] divider.length=\(divider.length) window=\(divider.button?.window?.frame ?? .zero)")
+        log("[\(label)] filler.length=\(filler.length) visible=\(filler.isVisible) window=\(filler.button?.window?.frame ?? .zero)")
         log("[\(label)] toggle.length=\(toggle.length) window=\(toggle.button?.window?.frame ?? .zero)")
     }
 
