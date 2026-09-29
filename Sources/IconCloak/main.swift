@@ -99,6 +99,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.onShortcutChanged = { [weak self] in self?.registerHotKey() }
         settings.onArrangeItems = { [weak self] in self?.arrangeItems() }
         settings.onOpenLog = { [weak self] in self?.openLog() }
+        settings.onDisplayModeChanged = { [weak self] in
+            guard let self else { return }
+            self.log("hide on main display only: \(UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly"))")
+            self.fillerScreen = nil
+            self.autoHideSuspended = false
+            self.updateFillers()
+        }
         settings.logMessage = { [weak self] in self?.log($0) }
         // Frames are only valid once macOS has laid the items out.
         toggle.isVisible = true
@@ -181,7 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setCollapsed(_ value: Bool) {
         guard value != collapsed, rolesReady, !arranging else { return }
-        if value, let screen = screenWithPointer(), let frame = itemFrame(Label.toggle, on: screen) {
+        if value, let screen = targetScreen(), let frame = itemFrame(Label.toggle, on: screen) {
             toggleRightInset = screen.frame.maxX - frame.maxX
         } else if value, let frame = toggle.button?.window?.frame,
                   let screen = NSScreen.screens.first(where: { $0.frame.minX <= frame.midX && frame.midX < $0.frame.maxX }) {
@@ -197,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             screenWatch?.invalidate()
             ownExpandButton = false
+            updateCovers()
             filler.length = NSStatusItem.variableLength
         }
         if value {
@@ -276,7 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// be at most half the display wide (a wider one is dropped). So the center is used as the notch.
     private func updateFillers() {
         guard collapsed else { return }
-        guard let inset = toggleRightInset, let screen = screenWithPointer() else {
+        guard let inset = toggleRightInset, let screen = targetScreen() else {
             log("fillers: no toggle position (inset=\(String(describing: toggleRightInset)), frame=\(String(describing: toggle.button?.window?.frame)))")
             return
         }
@@ -305,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startScreenWatch() {
         screenWatch?.invalidate()
         screenWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self, self.collapsed, let screen = self.screenWithPointer(), screen != self.fillerScreen else { return }
+            guard let self, self.collapsed, let screen = self.targetScreen(), screen != self.fillerScreen else { return }
             self.updateFillers()
         }
     }
@@ -314,9 +322,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// was dropped), there'd be no "«" to click and no "»" either — so expand again.
     private func verifyCollapse() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            guard let self, self.collapsed, AXIsProcessTrusted(), let screen = self.screenWithPointer() else { return }
+            guard let self, self.collapsed, AXIsProcessTrusted(), let screen = self.targetScreen() else { return }
             let onScreen = self.overflowButtons().contains {
                 $0.frame.midX >= screen.frame.minX && $0.frame.midX < screen.frame.maxX
+            }
+            // If MenuBarAgent's accessibility tree can't be read at all (it sometimes gets stuck
+            // until it's restarted), the result can't be checked, so don't treat it as a failure.
+            guard !self.menuBarItemFrames().isEmpty else {
+                self.log("can't read the menu bar layout (MenuBarAgent accessibility), skipping the check")
+                return
             }
             guard !onScreen else {
                 self.autoHideSuspended = false
@@ -329,16 +343,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Shows our own "«" when macOS's is not right next to the visible icons on this display.
+    /// Without a notch, macOS puts its "«" near the middle of the menu bar, far from the visible
+    /// icons. Then IconCloak draws its own "«" next to them and covers macOS's with a small window
+    /// (clicks still reach it and are caught by the click tap).
     private func updateOwnExpandButton() {
-        guard collapsed, let inset = toggleRightInset, let screen = screenWithPointer() else { return }
+        guard collapsed, let inset = toggleRightInset, let screen = targetScreen() else { return }
         let toggleRight = screen.frame.maxX - inset
         let system = overflowButtons().map(\.frame).filter { $0.midX >= screen.frame.minX && $0.midX < screen.frame.maxX }
-        let adjacent = system.contains { toggleRight - $0.maxX < 48 && toggleRight - $0.maxX > -48 }
-        guard ownExpandButton == adjacent else { return } // already right
-        ownExpandButton = !adjacent
-        log("own « button: \(ownExpandButton ? "shown" : "hidden") (macOS's at \(system.map { Int($0.minX) }), toggle ends at \(Int(toggleRight)))")
-        configureButtons()
+        let far = !system.isEmpty && system.allSatisfy { abs(toggleRight - $0.maxX) > 48 }
+        if ownExpandButton != far {
+            ownExpandButton = far
+            log("own « button: \(far ? "shown" : "hidden") on \(screen.localizedName)")
+            configureButtons()
+        }
+        updateCovers()
+    }
+
+    // MARK: - Covering macOS's "«"
+
+    private var covers: [NSPanel] = []
+    /// Closest to the menu bar's own background in tests (none match it exactly).
+    private var coverMaterial: NSVisualEffectView.Material = .popover
+
+    private func updateCovers() {
+        covers.forEach { $0.orderOut(nil) }
+        covers = []
+        guard collapsed, ownExpandButton, let primary = NSScreen.screens.first else { return }
+        for frame in overflowButtons().map(\.frame) {
+            // AX frames are top-left based on the primary display; AppKit windows bottom-left.
+            let rect = NSRect(x: frame.minX - 2, y: primary.frame.maxY - frame.maxY - 1,
+                              width: frame.width + 4, height: frame.height + 2)
+            let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
+            panel.ignoresMouseEvents = true
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+            panel.isOpaque = false
+            panel.backgroundColor = .clear
+            panel.hasShadow = false
+            // The menu bar has its own light/dark appearance (it follows the wallpaper, not the
+            // system setting); our status item button reports it.
+            panel.appearance = toggle.button?.effectiveAppearance
+            let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: rect.size))
+            effect.material = coverMaterial
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            panel.contentView = effect
+            panel.orderFrontRegardless()
+            covers.append(panel)
+        }
+    }
+
+    /// The display hiding is set up for: the main display (the one with the menu bar in the
+    /// Displays arrangement) when "Only hide icons on the main display" is on, otherwise the
+    /// display with the pointer.
+    private func targetScreen() -> NSScreen? {
+        if UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly"), let main = NSScreen.screens.first { return main }
+        return screenWithPointer()
     }
 
     private func screenWithPointer() -> NSScreen? {
@@ -690,6 +750,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.log("len \(parts[0]) = \(n)")
             case "menu": self.showMenu(on: self.collapsed ? self.toggle : self.divider)
             case "settings": SettingsWindow.shared.show()
+            case let c where c.hasPrefix("cover:"):
+                let names: [String: NSVisualEffectView.Material] = [
+                    "titlebar": .titlebar, "menu": .menu, "popover": .popover, "sidebar": .sidebar,
+                    "headerView": .headerView, "sheet": .sheet, "windowBackground": .windowBackground,
+                    "hudWindow": .hudWindow, "fullScreenUI": .fullScreenUI, "toolTip": .toolTip,
+                    "contentBackground": .contentBackground, "underWindowBackground": .underWindowBackground,
+                    "underPageBackground": .underPageBackground,
+                ]
+                if let m = names[String(c.dropFirst(6))] { self.coverMaterial = m; self.updateCovers() }
             case "front": self.moveDividerToFront()
             case "arrange": self.arrangeItems()
             case "collapse": self.setCollapsed(true)

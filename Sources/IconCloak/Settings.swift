@@ -67,6 +67,7 @@ final class SettingsModel: ObservableObject {
     var onShortcutChanged: (() -> Void)?
     var onArrangeItems: (() -> Void)?
     var onOpenLog: (() -> Void)?
+    var onDisplayModeChanged: (() -> Void)?
     var logMessage: ((String) -> Void)?
 
     @Published var autoHideEnabled: Bool = UserDefaults.standard.integer(forKey: "autoHideDelay") > 0 {
@@ -94,6 +95,12 @@ final class SettingsModel: ObservableObject {
         }
     }
     @Published var launchAtLoginError: String?
+    @Published var mainDisplayOnly: Bool = UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly") {
+        didSet {
+            UserDefaults.standard.set(mainDisplayOnly, forKey: "hideOnMainDisplayOnly")
+            onDisplayModeChanged?()
+        }
+    }
 
     private func saveAutoHide() {
         UserDefaults.standard.set(autoHideEnabled ? max(autoHideSeconds, 1) : 0, forKey: "autoHideDelay")
@@ -120,6 +127,14 @@ struct SettingsView: View {
                 .disabled(!model.autoHideEnabled)
                 .foregroundStyle(model.autoHideEnabled ? .primary : .secondary)
                 Text("IconCloak waits while the pointer is on the menu bar or a menu is open.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Toggle("Only hide icons on the main display", isOn: $model.mainDisplayOnly)
+                Text(model.mainDisplayOnly
+                     ? "Menu bar items have the same width on every display, so displays the same size as the main one hide the icons too."
+                     : "Hiding is set up for the display your pointer is on.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

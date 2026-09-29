@@ -74,6 +74,10 @@ After launch you'll see two new items in the menu bar: `»` and a thin `|`.
   - **The keyboard shortcut**, which you can change: click it and press the new combination
     (Esc cancels, **Reset** restores ⌃⌥⌘H).
   - **Launch at login.**
+  - **Only hide icons on the main display.** With several displays, hiding normally follows
+    the display your pointer is on. With this on, it's always set up for the main display.
+    Displays of the same size as the main one hide the icons too, since menu bar items have
+    the same width on every display.
 
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
 moves `»` back in front after a moment (your mouse pointer briefly jumps), and the icon
@@ -171,9 +175,19 @@ fake notch in the middle of the screen, it may cover macOS's one.)
 
 ### Hiding doesn't work on one of my displays
 
-IconCloak sets up hiding for the display your pointer is on. Move the pointer onto that
-display and hide the icons again. If hiding fails, IconCloak shows the icons again right away
-and pauses auto-hide until the next successful hide.
+IconCloak sets up hiding for the display your pointer is on (or for the main display, if
+**Only hide icons on the main display** is on in Settings). Move the pointer onto that
+display and hide the icons again. If hiding fails, IconCloak shows the icons again right
+away and pauses auto-hide until the next successful hide.
+
+### Hiding stopped working everywhere
+
+macOS's menu bar process occasionally gets stuck in a way that keeps IconCloak from reading
+the menu bar. Restarting it fixes that (the menu bar flickers once):
+
+```bash
+killall MenuBarAgent
+```
 
 ### The keyboard shortcut doesn't do anything
 

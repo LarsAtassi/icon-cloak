@@ -19,7 +19,8 @@ Hide menu bar icons on macOS 27. A small, open-source take on
   The icons between them get hidden. Hold **⌘** and drag icons in or out.
 - **Auto-hide (optional):** hide the icons again a set number of seconds after expanding.
   It waits while your pointer is on the menu bar or a menu is open.
-- **Settings:** auto-hide, your own keyboard shortcut and launch at login, in one window.
+- **Settings:** auto-hide, your own keyboard shortcut, launch at login, and whether to hide
+  icons only on the main display.
 - **Stays hidden when you switch apps.** IconCloak adapts to each app's menus, so hidden
   icons don't reappear next to short menus like Finder's.
 
@@ -38,7 +39,7 @@ and troubleshooting. The short version:
    down and click **Open Anyway**.
 4. Grant **Accessibility** when asked: System Settings → Privacy & Security →
    Accessibility → IconCloak. IconCloak picks it up within a couple of seconds.
-5. Optional: right-click `»` → **Launch at Login**.
+5. Optional: right-click `»` → **Settings…** → **Launch at login**.
 
 Every release is signed with the same certificate, so the Accessibility permission carries
 over when you update. Just replace the app in Applications.
@@ -101,11 +102,14 @@ The full write-up, including what didn't work, is in [docs/how-it-works.md](docs
 ## Limitations
 
 - Tested on a MacBook with a notch and on external displays without one. With several
-  displays, hiding is set up for the display your pointer is on, and adjusts when you move
-  to another one.
-- On displays without a notch, macOS puts its `«` near the middle of the menu bar, so
-  IconCloak adds its own `«` next to your visible icons.
-- No settings window yet. Everything is in the right-click menu.
+  displays, hiding is set up for the display your pointer is on (or, if you choose, always
+  for the main display). Menu bar items have the same width on every display, so displays
+  of the same size as that one hide the icons too.
+- On displays without a notch, macOS puts its `«` near the middle of the menu bar. IconCloak
+  adds its own `«` next to your visible icons and covers macOS's with a small patch, which
+  can look slightly lighter than the menu bar.
+- Items macOS never hides, such as the green camera and microphone indicator during calls,
+  stay visible and sit next to macOS's `«`.
 - It relies on how macOS 27 lays out the menu bar, which isn't a public API. A macOS update
   may break it.
 
