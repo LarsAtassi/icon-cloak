@@ -80,6 +80,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var swallowNextMouseUp = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Two instances would fight over the menu bar (e.g. a second copy started from another
+        // folder), so only the first one keeps running.
+        let me = NSRunningApplication.current
+        if let bundleID = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).contains(where: { $0 != me }) {
+            log("another IconCloak is already running, quitting \(Bundle.main.bundlePath)")
+            NSApp.terminate(nil)
+            return
+        }
         // macOS 27 decides the initial order itself, so roles are assigned by position
         // (see ensureOrder): the left item is the divider, the right one the toggle.
         toggle = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
