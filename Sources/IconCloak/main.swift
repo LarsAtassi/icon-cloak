@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Status item windows are this much wider than `length` (button padding).
     private let itemPadding: CGFloat = 16
     private let margin: CGFloat = 8
+    private let overflowButtonRoom: CGFloat = 24
 
     /// Distance from the toggle's right edge to its screen's right edge, measured while expanded.
     /// Status items sit at the same distance from the right on every display's menu bar, so this
@@ -46,6 +47,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// fillers are sized for the display the user is on (the one with the pointer).
     private var fillerScreen: NSScreen?
     private var screenWatch: Timer?
+    private var missingToggleChecks = 0
+    /// Room right of "|" that only exists while collapsed: macOS moves items it never hides
+    /// (the microphone/camera pill, a recording indicator) next to the visible icons then.
+    /// Learned while collapsed and reused on the next hide.
+    private var collapsedExtra: CGFloat = 0
+    private var expandedInset: CGFloat?
+    private var shrinkSteps = 0
+    private var lastMeasuredInset: CGFloat?
+    /// When the fillers were last resized; the menu bar takes a moment to settle afterwards.
+    private var lastFillerResize = Date.distantPast
+    private var hoverReleased = false
 
     /// Watches macOS's overflow button while collapsed: clicking it ("«" → "»") expands IconCloak.
     private var overflowWatch: Timer?
@@ -55,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// needed when macOS's "«" ends up far from them (on displays without a notch it sits near
     /// the center, where apps drawing a fake notch can even cover it).
     private var ownExpandButton = false
+    private var ownExpandPending = 0
     private let expandImage: NSImage? = {
         let image = NSImage(systemSymbolName: "chevron.left.2", accessibilityDescription: "Show menu bar icons")?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
@@ -197,8 +210,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setCollapsed(_ value: Bool) {
         guard value != collapsed, rolesReady, !arranging else { return }
+        if value, !hoverReleased, AXIsProcessTrusted(), foreignTooltipVisible() {
+            hoverReleased = true
+            releaseHoverBeforeHiding()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.setCollapsed(true) }
+            return
+        }
+        hoverReleased = false
         if value, let screen = targetScreen(), let frame = itemFrame(Label.toggle, on: screen) {
-            toggleRightInset = screen.frame.maxX - frame.maxX
+            expandedInset = screen.frame.maxX - frame.maxX
+            toggleRightInset = screen.frame.maxX - frame.maxX + collapsedExtra
+            shrinkSteps = 0
         } else if value, let frame = toggle.button?.window?.frame,
                   let screen = NSScreen.screens.first(where: { $0.frame.minX <= frame.midX && frame.midX < $0.frame.maxX }) {
             toggleRightInset = screen.frame.maxX - frame.maxX
@@ -213,6 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             screenWatch?.invalidate()
             ownExpandButton = false
+            ownExpandPending = 0
             updateCovers()
             filler.length = NSStatusItem.variableLength
         }
@@ -305,9 +328,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menusEnd = screen.frame.minX + menusWidth
         let notchLeft = screen.auxiliaryTopLeftArea?.maxX ?? screen.frame.midX
         let notchRight = screen.auxiliaryTopRightArea?.minX ?? screen.frame.midX
-        let toggleLength = toggleRight - notchRight - margin - itemPadding
+        // Leave room for macOS's "«": since macOS 27.2 it needs its own space next to the filler
+        // instead of squeezing into it, and a filler that leaves none gets pushed aside.
+        let toggleLength = toggleRight - notchRight - margin - itemPadding - overflowButtonRoom
         let fillerLength = notchLeft - menusEnd - margin - itemPadding
         fillerScreen = screen
+        if toggle.length != max(toggleLength, 0) || filler.length != max(fillerLength, 0) { lastFillerResize = Date() }
         if toggle.length != max(toggleLength, 0) {
             toggle.length = max(toggleLength, 0)
             if ownExpandButton { configureButtons() } // the "«" image is as wide as the filler
@@ -318,12 +344,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + "menus end at \(Int(menusWidth)), toggle \(Int(toggleLength)), filler \(Int(fillerLength))")
     }
 
-    /// While collapsed, re-size the fillers when the pointer moves to another display.
+    /// While collapsed, re-size the fillers when the pointer moves to another display, or when
+    /// the visible icons right of "|" change width (an icon appears, disappears or shows changing
+    /// text): the right filler is sized to end exactly where they begin.
     private func startScreenWatch() {
         screenWatch?.invalidate()
-        screenWatch = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self, self.collapsed, let screen = self.targetScreen(), screen != self.fillerScreen else { return }
-            self.updateFillers()
+        missingToggleChecks = 0
+        lastMeasuredInset = nil
+        screenWatch = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self, self.collapsed, let screen = self.targetScreen() else { return }
+            if screen != self.fillerScreen { return self.updateFillers() }
+            self.updateOwnExpandButton()
+            guard AXIsProcessTrusted(), !self.menuBarItemFrames().isEmpty else { return }
+            let notchRight = screen.auxiliaryTopRightArea?.minX ?? screen.frame.midX
+            // In place = still on the right side of the notch. Its left end may reach under the
+            // notch (macOS 27.2 allows that); pushed aside, it ends up left of the notch.
+            if let frame = self.itemFrame(Label.toggle, on: screen), frame.maxX > notchRight + 4 {
+                // Its right edge shows exactly how much sits right of it.
+                self.missingToggleChecks = 0
+                self.shrinkSteps = 0
+                let inset = screen.frame.maxX - frame.maxX
+                // Only act on a measurement seen twice in a row: while macOS animates a change,
+                // the filler passes through in-between positions.
+                defer { self.lastMeasuredInset = inset }
+                guard let last = self.lastMeasuredInset, abs(inset - last) <= 2 else { return }
+                if let old = self.toggleRightInset, abs(inset - old) > 2 {
+                    self.log("room right of | changed (\(Int(old)) → \(Int(inset)) pt): resizing fillers")
+                    self.toggleRightInset = inset
+                    if let expanded = self.expandedInset { self.collapsedExtra = max(0, inset - expanded) }
+                    self.fillerScreen = nil
+                    self.updateFillers()
+                }
+            } else {
+                // Pushed aside: more sits right of "|" than measured (visible icons grew, or macOS
+                // added an item it never hides). Shrink the filler step by step until it fits again;
+                // once it does, the branch above measures the exact room.
+                self.missingToggleChecks += 1
+                guard self.missingToggleChecks >= 2 else { return }
+                self.missingToggleChecks = 0
+                self.shrinkSteps += 1
+                guard self.shrinkSteps <= 6, let inset = self.toggleRightInset else {
+                    self.log("right filler doesn't fit even after shrinking: showing the icons, auto-hide paused")
+                    self.autoHideSuspended = true
+                    self.setCollapsed(false)
+                    return
+                }
+                self.log("right filler pushed aside: shrinking it (step \(self.shrinkSteps))")
+                // Growing steps (32, 64, 128 … pt) settle a large jump quickly; if that overshoots,
+                // the in-place branch measures the exact room and grows the filler back.
+                self.toggleRightInset = inset + min(32 * pow(2, CGFloat(self.shrinkSteps - 1)), 256)
+                self.fillerScreen = nil
+                self.updateFillers()
+            }
         }
     }
 
@@ -355,16 +427,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Without a notch, macOS puts its "«" near the middle of the menu bar, far from the visible
     /// icons. Then IconCloak draws its own "«" next to them and covers macOS's with a small window
     /// (clicks still reach it and are caught by the click tap).
+    /// Shows our own "«" (and covers macOS's) when macOS's "«" is far from the visible icons,
+    /// as on displays without a notch where it sits near the middle. On a notched display it's
+    /// usually right next to them, where ours would go. While macOS relays out the menu bar its
+    /// "«" is briefly missing or in between, so a change only counts once it's seen on three
+    /// checks in a row (called every 0.3 s while collapsed).
     private func updateOwnExpandButton() {
         guard collapsed, let inset = toggleRightInset, let screen = targetScreen() else { return }
+        // Right after a resize macOS may still be moving its "«" between the fillers.
+        guard Date().timeIntervalSince(lastFillerResize) > 1.5 else { ownExpandPending = 0; return }
         let toggleRight = screen.frame.maxX - inset
         let system = overflowButtons().map(\.frame).filter { $0.midX >= screen.frame.minX && $0.midX < screen.frame.maxX }
-        let far = !system.isEmpty && system.allSatisfy { abs(toggleRight - $0.maxX) > 48 }
-        if ownExpandButton != far {
-            ownExpandButton = far
-            log("own « button: \(far ? "shown" : "hidden") on \(screen.localizedName)")
-            configureButtons()
-        }
+        guard !system.isEmpty else { return } // mid-relayout: keep the current state
+        let wanted = system.allSatisfy { abs(toggleRight - $0.maxX) > 48 }
+        guard wanted != ownExpandButton else { ownExpandPending = 0; return }
+        ownExpandPending += 1
+        guard ownExpandPending >= 3 else { return }
+        ownExpandPending = 0
+        ownExpandButton = wanted
+        log("own « button: \(wanted ? "shown" : "hidden") on \(screen.localizedName)")
+        configureButtons()
         updateCovers()
     }
 
@@ -374,32 +456,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Closest to the menu bar's own background in tests (none match it exactly).
     private var coverMaterial: NSVisualEffectView.Material = .popover
 
-    private func updateCovers() {
-        covers.forEach { $0.orderOut(nil) }
-        covers = []
-        guard collapsed, ownExpandButton, let primary = NSScreen.screens.first else { return }
-        for frame in overflowButtons().map(\.frame) {
-            // AX frames are top-left based on the primary display; AppKit windows bottom-left.
-            let rect = NSRect(x: frame.minX - 2, y: primary.frame.maxY - frame.maxY - 1,
-                              width: frame.width + 4, height: frame.height + 2)
-            let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-            panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
-            panel.ignoresMouseEvents = true
-            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = false
+    /// Keeps a cover over each of macOS's "«" buttons while collapsed. Called often (from the
+    /// overflow watch), so existing covers are only moved, not rebuilt, to avoid flicker.
+    private func updateCovers(_ frames: [CGRect]? = nil) {
+        guard collapsed, ownExpandButton, let primary = NSScreen.screens.first else {
+            covers.forEach { $0.orderOut(nil) }
+            covers = []
+            return
+        }
+        // AX frames are top-left based on the primary display; AppKit windows bottom-left.
+        let top = primary.frame.maxY
+        var sources: [CGRect] = frames ?? overflowButtons().map(\.frame)
+        if let inset = toggleRightInset, let screen = targetScreen() {
+            let toggleRight = screen.frame.maxX - inset
+            sources.removeAll { $0.midX >= screen.frame.minX && $0.midX < screen.frame.maxX && abs(toggleRight - $0.maxX) <= 48 }
+        }
+        let rects: [NSRect] = sources.map { (f: CGRect) -> NSRect in
+            NSRect(x: f.minX - 2, y: top - f.maxY - 1, width: f.width + 4, height: f.height + 2)
+        }
+        while covers.count > rects.count { covers.removeLast().orderOut(nil) }
+        while covers.count < rects.count { covers.append(makeCover()) }
+        for (panel, rect) in zip(covers, rects) where panel.frame != rect || !panel.isVisible {
+            panel.setFrame(rect, display: true)
+            (panel.contentView as? NSVisualEffectView)?.material = coverMaterial
             // The menu bar has its own light/dark appearance (it follows the wallpaper, not the
             // system setting); our status item button reports it.
             panel.appearance = toggle.button?.effectiveAppearance
-            let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: rect.size))
-            effect.material = coverMaterial
-            effect.blendingMode = .behindWindow
-            effect.state = .active
-            panel.contentView = effect
             panel.orderFrontRegardless()
-            covers.append(panel)
         }
+    }
+
+    private func makeCover() -> NSPanel {
+        let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        let effect = NSVisualEffectView()
+        effect.material = coverMaterial
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.autoresizingMask = [.width, .height]
+        panel.contentView = effect
+        return panel
     }
 
     /// The display hiding is set up for: the main display (the one with the menu bar in the
@@ -408,6 +509,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func targetScreen() -> NSScreen? {
         if UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly"), let main = NSScreen.screens.first { return main }
         return screenWithPointer()
+    }
+
+    /// Another app's tooltip currently on screen (e.g. after resting the pointer on an icon).
+    private func foreignTooltipVisible() -> Bool {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        let tooltipLevel = 103 // tooltip window level on macOS 27
+        return windows.contains {
+            ($0[kCGWindowLayer as String] as? Int) == tooltipLevel && ($0[kCGWindowOwnerPID as String] as? pid_t) != getpid()
+        }
+    }
+
+    /// A tooltip whose icon goes into the overflow stays on screen for good: the icon vanished
+    /// under the pointer, so its app never got a "mouse exited" (and only real pointer movement
+    /// over its visible icon clears it). So before hiding, move the pointer off the menu bar for
+    /// a moment, which delivers that event, and put it back without events (so no new hover
+    /// starts on an icon that's about to disappear).
+    private func releaseHoverBeforeHiding() {
+        guard let location = CGEvent(source: nil)?.location else { return }
+        CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: location.x, y: location.y + 150),
+                mouseButton: .left)?.post(tap: .cghidEventTap)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { CGWarpMouseCursorPosition(location) }
+        log("released hover before hiding (another app's tooltip was showing)")
     }
 
     private func screenWithPointer() -> NSScreen? {
@@ -441,6 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.collapsed else { return }
             let buttons = self.overflowButtons()
             self.overflowButtonFrames = buttons.map(\.frame)
+            self.updateCovers(self.overflowButtonFrames)
             guard let first = buttons.first else { return }
             guard let baseline = self.overflowBaseline else { self.overflowBaseline = first.label; return }
             if let label = buttons.first(where: { $0.label != baseline })?.label {
@@ -615,13 +739,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             e?.flags = .maskCommand
             e?.post(tap: .cghidEventTap)
         }
-        post(.leftMouseDown, x0)
-        let steps = 12
+        // macOS 27.2 only picks an item up after a short hold, and drops it reliably only after
+        // the pointer has rested at the target, so: move there, hold, drag in steps, rest, release.
+        post(.mouseMoved, x0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { post(.leftMouseDown, x0) }
+        let hold = 0.3, steps = 24, stepTime = 0.015
         for i in 1...steps {
             let x = x0 + (x1 - x0) * CGFloat(i) / CGFloat(steps)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(i)) { post(.leftMouseDragged, x) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold + stepTime * Double(i)) { post(.leftMouseDragged, x) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(steps + 3)) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + hold + stepTime * Double(steps) + 0.2) {
             post(.leftMouseUp, x1)
             if let restore { CGWarpMouseCursorPosition(restore) }
             completion?()
@@ -776,19 +903,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case "axdump": self.dumpMenuBarAgent(press: false)
             case "pressoverflow": self.dumpMenuBarAgent(press: true)
             case let c where c.hasPrefix("cmddrag:"):
-                // "cmddrag:x1,x2" — ⌘-drags along the menu bar from x1 to x2.
+                // "cmddrag:x1,x2" — ⌘-drags along the main display's menu bar from x1 to x2.
                 let p = c.dropFirst(8).split(separator: ",").compactMap { Double($0) }
                 guard p.count == 2 else { return }
-                func post(_ type: CGEventType, _ x: Double) {
-                    let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: 19), mouseButton: .left)
-                    e?.flags = .maskCommand
-                    e?.post(tap: .cghidEventTap)
+                self.drag(from: p[0], to: p[1], on: NSScreen.screens.first)
+            case let c where c.hasPrefix("move:"):
+                // "move:x,y" — real mouse-moved events around x,y (lets apps see a hover).
+                let p = c.dropFirst(5).split(separator: ",").compactMap { Double($0) }
+                guard p.count == 2 else { return }
+                for (i, dx) in [0.0, 1, 2, 1, 0].enumerated() {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05 * Double(i)) {
+                        CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: p[0] + dx, y: p[1]), mouseButton: .left)?.post(tap: .cghidEventTap)
+                    }
                 }
-                post(.leftMouseDown, p[0])
-                for i in 1...12 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(i)) { post(.leftMouseDragged, p[0] + (p[1] - p[0]) * Double(i) / 12) }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { post(.leftMouseUp, p[1]) }
             case let c where c.hasPrefix("click:"):
                 // "click:x,y" in global top-left coordinates — simulates a real mouse click.
                 let p = c.dropFirst(6).split(separator: ",").compactMap { Double($0) }

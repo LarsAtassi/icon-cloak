@@ -69,6 +69,35 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
   even cover it). When that's the case, IconCloak draws its own `«` at the right edge of
   the right filler. macOS centers a status item's content and ignores text alignment, so
   it's an image as wide as the filler with the chevron at its right edge.
+- **Following the visible icons.** The right filler is sized to end exactly where the
+  visible icons begin. If one of them changes width while collapsed (an icon appears or
+  shows changing text), the filler no longer fits. So every 0.3 s IconCloak reads where `|`
+  really is, resizes the fillers when it moved, and hides again from scratch if macOS has
+  pushed the filler aside.
+- **Where macOS puts its `«`** differs: on the MacBook's notched display it sits at the
+  right end of the right filler, next to the visible icons; on displays without a notch,
+  near the middle. IconCloak only draws its own `«` (and covers macOS's) in the second case,
+  and only switches after seeing the change on two checks in a row, since `«` is briefly
+  missing or in between while macOS relays out the menu bar.
+- **Items macOS never hides** (the microphone/camera pill during calls, a screen-recording
+  button) are moved next to the visible icons while collapsed, which takes room the right
+  filler didn't account for. If the filler gets pushed aside, IconCloak shrinks it in
+  growing steps (32, 64, 128 … pt) until it fits, then measures the exact room. It doesn't
+  hide again from scratch (that measures the expanded layout again, which doesn't include
+  those items, and loops). What it learned is reused on the next hide.
+- **macOS 27.2 changes:** the overflow button `«` (now identified as
+  `menu-bar-overflow-indicator`) needs its own room next to the right filler, so IconCloak
+  leaves ~24 pt for it. The right filler may extend under the notch; it counts as in place
+  as long as its right edge is right of the notch. Simulated ⌘-drags only register with a
+  short hold after pressing and a pause before releasing.
+- **Settling.** Measurements only count when seen twice in a row, and the own-`«` decision
+  waits 1.5 s after a resize and needs three consistent checks, because macOS passes
+  through in-between layouts (and can move its `«` between the fillers) while animating.
+- **Stranded tooltips.** If the pointer rests on an icon that then goes into the overflow,
+  its app never gets a "mouse exited", and the icon's tooltip stays on screen for good (only
+  real pointer movement over the visible icon clears it; events sent straight to the app
+  don't). So when another app's tooltip is showing at the moment IconCloak hides, it first
+  moves the pointer off the menu bar for a moment and puts it back without events.
 - **Finding its own items.** `NSStatusItem` window frames don't follow the layout macOS
   shows, so IconCloak gives its items accessibility labels and reads their real positions
   from `MenuBarAgent`'s accessibility tree.
