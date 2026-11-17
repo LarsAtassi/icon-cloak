@@ -7,7 +7,7 @@ This page covers what changed, what IconCloak does instead, and what didn't work
 
 Everything here was found by experiment on a 14" MacBook Pro (notch, 2056 pt wide) and on
 external displays without a notch (2560 × 1440 and a 1440 × 2560 portrait display), running
-macOS 27.0 (26A428). None of it is documented by Apple.
+macOS 27.0 (26A428) to 27.2.1 (26B131). None of it is documented by Apple.
 
 ## What changed in macOS 27
 
@@ -72,8 +72,7 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
 - **Following the visible icons.** The right filler is sized to end exactly where the
   visible icons begin. If one of them changes width while collapsed (an icon appears or
   shows changing text), the filler no longer fits. So every 0.3 s IconCloak reads where `|`
-  really is, resizes the fillers when it moved, and hides again from scratch if macOS has
-  pushed the filler aside.
+  really is and resizes the fillers when it moved.
 - **Where macOS puts its `«`** differs: on the MacBook's notched display it sits at the
   right end of the right filler, next to the visible icons; on displays without a notch,
   near the middle. IconCloak only draws its own `«` (and covers macOS's) in the second case,
@@ -114,6 +113,38 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
   of `|` and `»` in front of the leftmost icon. This happens at launch, from the menu, and
   half a second after the user ⌘-drags something in the menu bar (a global `leftMouseUp`
   monitor), so icons can't be placed left of `»`.
+- **New icons.** macOS puts a new app's status item at the far left, which is the hidden
+  section, so new icons would disappear right away. IconCloak remembers which apps' icons it
+  has seen (by bundle ID). When an unknown app's icon shows up left of `|`, it ⌘-drags it right
+  of `|`, then re-arranges its own items, since the move can leave the invisible filler on the
+  wrong side of `|` (which keeps the right filler from ever fitting). Hidden icons can't be
+  seen through accessibility at all, so when an unknown app launches while collapsed,
+  IconCloak briefly expands to check. Background-only apps are skipped, and apps without an
+  icon are remembered too. On the first run, everything already in the menu bar counts as
+  known, and more than three unknown icons at once are taken as an existing arrangement, not
+  new apps. `NSWorkspace.didLaunchApplicationNotification` isn't posted for apps without a
+  Dock icon (most menu bar apps), so IconCloak observes `runningApplications` instead.
+- **A filler on the wrong side.** If the filler ends up right of `|` (an icon dropped between
+  them, for example), no width makes the icons hide. While hidden, IconCloak checks for that
+  (the filler is then the rightmost of its items), shows the icons, re-arranges and hides
+  again, once. And if shrinking and growing the right filler keeps repeating, it stops after
+  three rounds, shows the icons and pauses auto-hide.
+- **Its own drags.** IconCloak never starts a drag while a mouse button is held (you may be
+  dragging an icon yourself), and it ignores the mouse-up of its own drags, which otherwise
+  look like yours when the pointer is put back onto the menu bar. After a drag the pointer is
+  put back without events, so the icon under the drop point still thinks it's hovered and
+  may show its tooltip at the restored position for good. Two seconds after a drag, if
+  another app's tooltip is on screen, IconCloak moves the pointer away for a moment, as it
+  does before hiding.
+- **Don't touch the drag sequence.** macOS 27.2 reorders status items with a WindowServer
+  window drag (`MenuBarAgent` logs `com.apple.menubar:drag`, the WindowServer logs under
+  `windowinteraction`). Extra simulated events around the drop (a pointer move 50 ms after
+  releasing, key events for ⌘) left the WindowServer unable to track any drag, real ones
+  included, until the next logout: "no client initiated window drag trait gesture to
+  activate for mouse". Restarting `MenuBarAgent` doesn't help. After changing `drag()`, do
+  one drag and check the log before doing more:
+  `/usr/bin/log show --last 1m --info --predicate 'process == "WindowServer" AND eventMessage CONTAINS "window drag trait"'`
+  (a healthy drag has one `commitDragMovement` per step and no such error).
 - **Expanding** animates the items shrinking back from filler width (~300 ms, drawn by
   `MenuBarAgent`, so `NSAnimationContext` can't turn it off). During that time `»` and `|`
   are drawn transparent: they take their final width, so nothing shifts when they appear,
@@ -140,3 +171,7 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
 - Whether the three-item layout needs any tuning on the MacBook's own notched display
   (tested before the filler moved next to `|`).
 - Whether `MenuBarAgent` changes this behavior in later macOS 27.x updates.
+- On the notched display, a right filler a few points too short lets macOS squeeze the left
+  filler in under the notch (with `«` between them), and `|`'s right edge then reads 8 pt
+  further right. IconCloak's measurements settle on the right size, but it's one more layout
+  to keep in mind.

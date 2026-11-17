@@ -79,6 +79,11 @@ After launch you'll see two new items in the menu bar: `»` and a thin `|`.
     Displays of the same size as the main one hide the icons too, since menu bar items have
     the same width on every display.
 
+When an app you haven't used with IconCloak before adds a menu bar icon, macOS puts it at the
+far left, in the hidden section. IconCloak moves it right of `|` so you see it (if the icons
+are hidden at that moment, they're shown for a second while it does that). After that, the
+icon stays wherever you drag it.
+
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
 moves `»` back in front after a moment (your mouse pointer briefly jumps), and the icon
 becomes one of the hidden ones.
@@ -167,6 +172,11 @@ permission.
 Everything between `»` and `|` gets hidden. Expand with `«`, then hold **⌘** and drag icons
 into or out of that area.
 
+### A new app's icon was hidden right away
+
+IconCloak only moves the icons of apps it hasn't seen before, and only once. Show the icons
+with `«`, then hold **⌘** and drag the icon right of `|`.
+
 ### There are two `«` buttons (external display)
 
 On displays without a notch, macOS puts its own `«` near the middle of the menu bar, so
@@ -179,6 +189,11 @@ IconCloak sets up hiding for the display your pointer is on (or for the main dis
 **Only hide icons on the main display** is on in Settings). Move the pointer onto that
 display and hide the icons again. If hiding fails, IconCloak shows the icons again right
 away and pauses auto-hide until the next successful hide.
+
+### I can't ⌘-drag menu bar icons anymore
+
+If macOS lifts an icon but it doesn't follow the pointer (also with IconCloak quit), macOS's
+window server has lost track of drags. Log out and back in, or restart the Mac.
 
 ### Hiding stopped working everywhere
 

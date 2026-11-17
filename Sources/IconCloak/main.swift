@@ -55,6 +55,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var expandedInset: CGFloat?
     private var shrinkSteps = 0
     private var lastMeasuredInset: CGFloat?
+    private var misplacedFillerChecks = 0
+    private var ownDragUntil = Date.distantPast // IconCloak's own simulated drag is in progress
+    private var repairedFiller = false      // once per hide
+    private var shrunkSinceResize = false
+    private var regrowCycles = 0            // shrink → grow back cycles in this hide
     /// When the fillers were last resized; the menu bar takes a moment to settle afterwards.
     private var lastFillerResize = Date.distantPast
     private var hoverReleased = false
@@ -142,11 +147,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Keep the arrangement after the user ⌘-drags something in the menu bar: "»" back in
         // front, the filler next to "|" (global mouse monitors need Accessibility).
         NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
-            guard let self, !self.collapsed, event.modifierFlags.contains(.command),
+            // Not IconCloak's own simulated drags: reacting to them would loop.
+            guard let self, Date() >= self.ownDragUntil,
+                  !self.collapsed, event.modifierFlags.contains(.command),
                   let screen = self.screenWithPointer(), NSEvent.mouseLocation.y > screen.frame.maxY - 40 else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.arrangeItems() }
         }
 
+        // didLaunchApplicationNotification skips apps without a Dock icon, which are most apps
+        // that add menu bar icons, so watch the list of running apps instead.
+        launchWatch = NSWorkspace.shared.observe(\.runningApplications, options: [.new]) { [weak self] _, change in
+            let apps = change.newValue ?? []
+            DispatchQueue.main.async { apps.forEach { self?.appLaunched($0) } }
+        }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.updateFillers() }
@@ -212,7 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard value != collapsed, rolesReady, !arranging else { return }
         if value, !hoverReleased, AXIsProcessTrusted(), foreignTooltipVisible() {
             hoverReleased = true
-            releaseHoverBeforeHiding()
+            releaseHover(reason: "before hiding")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.setCollapsed(true) }
             return
         }
@@ -221,6 +234,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             expandedInset = screen.frame.maxX - frame.maxX
             toggleRightInset = screen.frame.maxX - frame.maxX + collapsedExtra
             shrinkSteps = 0
+            regrowCycles = 0
+            shrunkSinceResize = false
         } else if value, let frame = toggle.button?.window?.frame,
                   let screen = NSScreen.screens.first(where: { $0.frame.minX <= frame.midX && frame.midX < $0.frame.maxX }) {
             toggleRightInset = screen.frame.maxX - frame.maxX
@@ -240,20 +255,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             filler.length = NSStatusItem.variableLength
         }
         if value {
+            glyphsHidden = false
             configureButtons()
         } else {
             // macOS animates our items shrinking from filler width (~300 ms); revealing "»" and
-            // "|" only afterwards keeps them from sliding in from the far left.
+            // "|" only afterwards keeps them from sliding in from the far left. A peek for a new
+            // icon keeps them invisible throughout, so no "»" flashes up on the far left.
             glyphsHidden = true
             configureButtons()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
-                glyphsHidden = false
-                configureButtons()
+            if !peeking {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
+                    glyphsHidden = false
+                    configureButtons()
+                }
             }
         }
         value ? startOverflowWatch() : stopOverflowWatch()
-        value ? autoHideTimer?.invalidate() : scheduleAutoHide()
+        if value { autoHideTimer?.invalidate() } else if !peeking { scheduleAutoHide() }
         log("---- \(value ? "COLLAPSE" : "EXPAND") ----")
+        if !value && !peeking {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.adoptNewStatusItems() }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.logState(label: value ? "collapsed" : "expanded") }
     }
 
@@ -350,6 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startScreenWatch() {
         screenWatch?.invalidate()
         missingToggleChecks = 0
+        misplacedFillerChecks = 0
         lastMeasuredInset = nil
         screenWatch = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             guard let self, self.collapsed, let screen = self.targetScreen() else { return }
@@ -359,16 +382,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let notchRight = screen.auxiliaryTopRightArea?.minX ?? screen.frame.midX
             // In place = still on the right side of the notch. Its left end may reach under the
             // notch (macOS 27.2 allows that); pushed aside, it ends up left of the notch.
-            if let frame = self.itemFrame(Label.toggle, on: screen), frame.maxX > notchRight + 4 {
+            let toggleFrame = self.itemFrame(Label.toggle, on: screen)
+            // The filler must be left of "|". If it ended up right of it (e.g. after an icon was
+            // dropped between them), no filler width works: re-arrange once, then hide again.
+            if let fillerFrame = self.itemFrame(Label.filler, on: screen), fillerFrame.maxX > notchRight + 4,
+               fillerFrame.maxX >= (toggleFrame?.maxX ?? 0) - 2 {
+                self.misplacedFillerChecks += 1
+                guard self.misplacedFillerChecks >= 2, !self.repairedFiller else { return }
+                self.repairedFiller = true
+                self.log("filler is right of |: re-arranging")
+                self.setCollapsed(false)
+                self.arrangeItems { self.setCollapsed(true) }
+                return
+            }
+            self.misplacedFillerChecks = 0
+            if let frame = toggleFrame, frame.maxX > notchRight + 4 {
                 // Its right edge shows exactly how much sits right of it.
                 self.missingToggleChecks = 0
                 self.shrinkSteps = 0
+                self.repairedFiller = false
                 let inset = screen.frame.maxX - frame.maxX
                 // Only act on a measurement seen twice in a row: while macOS animates a change,
                 // the filler passes through in-between positions.
                 defer { self.lastMeasuredInset = inset }
                 guard let last = self.lastMeasuredInset, abs(inset - last) <= 2 else { return }
                 if let old = self.toggleRightInset, abs(inset - old) > 2 {
+                    // Growing back after shrinking, over and over, means the measured room doesn't
+                    // fit after all: stop instead of cycling forever.
+                    if self.shrunkSinceResize {
+                        self.regrowCycles += 1
+                        if self.regrowCycles >= 3 {
+                            self.log("filler keeps getting pushed aside: showing the icons, auto-hide paused")
+                            self.autoHideSuspended = true
+                            self.setCollapsed(false)
+                            return
+                        }
+                    }
+                    self.shrunkSinceResize = false
                     self.log("room right of | changed (\(Int(old)) → \(Int(inset)) pt): resizing fillers")
                     self.toggleRightInset = inset
                     if let expanded = self.expandedInset { self.collapsedExtra = max(0, inset - expanded) }
@@ -389,6 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.setCollapsed(false)
                     return
                 }
+                self.shrunkSinceResize = true
                 self.log("right filler pushed aside: shrinking it (step \(self.shrinkSteps))")
                 // Growing steps (32, 64, 128 … pt) settle a large jump quickly; if that overshoots,
                 // the in-place branch measures the exact room and grows the filler back.
@@ -525,12 +576,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// over its visible icon clears it). So before hiding, move the pointer off the menu bar for
     /// a moment, which delivers that event, and put it back without events (so no new hover
     /// starts on an icon that's about to disappear).
-    private func releaseHoverBeforeHiding() {
+    private func releaseHover(reason: String) {
         guard let location = CGEvent(source: nil)?.location else { return }
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: location.x, y: location.y + 150),
                 mouseButton: .left)?.post(tap: .cghidEventTap)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { CGWarpMouseCursorPosition(location) }
-        log("released hover before hiding (another app's tooltip was showing)")
+        log("released hover \(reason) (another app's tooltip was showing)")
     }
 
     private func screenWithPointer() -> NSScreen? {
@@ -560,7 +611,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startOverflowWatch() {
         overflowBaseline = nil
         overflowWatch?.invalidate()
-        overflowWatch = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // Not much faster: frequent polling of MenuBarAgent's accessibility tree seems to make it
+        // get stuck (it then reports itself as its own child until restarted).
+        overflowWatch = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self, self.collapsed else { return }
             let buttons = self.overflowButtons()
             self.overflowButtonFrames = buttons.map(\.frame)
@@ -663,13 +716,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return v as? String
     }
 
+    // MARK: - New icons
+
+    // macOS puts a new menu bar icon at the far left, which in IconCloak's layout is the hidden
+    // section. So icons of apps IconCloak hasn't seen before are moved right of "|" (visible).
+    // While collapsed, hidden icons aren't visible to accessibility at all, so a first launch of
+    // an unknown app gets a short peek: expand, move its icon, collapse again.
+
+    private var peeking = false
+    private var launchWatch: NSKeyValueObservation?
+
+    /// Apps (bundle IDs) whose menu bar icons IconCloak has seen; their placement is the user's.
+    private var knownIconApps: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "knownIconApps") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: "knownIconApps") }
+    }
+    /// Apps that were checked once and turned out to have no menu bar icon.
+    private var appsWithoutIcons: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: "appsWithoutIcons") ?? []) }
+        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: "appsWithoutIcons") }
+    }
+
+    /// Visible menu bar icons per app, from each app's own accessibility (AXExtrasMenuBar).
+    /// Icons in the overflow aren't listed.
+    private func statusItemsByApp() -> [(app: String, frame: CGRect)] {
+        var result: [(app: String, frame: CGRect)] = []
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.processIdentifier != getpid(), let id = app.bundleIdentifier else { continue }
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            var bar: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(ax, kAXExtrasMenuBarAttribute as CFString, &bar) == .success, let bar else { continue }
+            for item in axChildren(bar as! AXUIElement) { result.append((id, axFrame(item))) }
+        }
+        return result
+    }
+
+    private func appLaunched(_ app: NSRunningApplication) {
+        guard let id = app.bundleIdentifier, app.processIdentifier != getpid(),
+              !knownIconApps.contains(id), !appsWithoutIcons.contains(id) else { return }
+        // Give the app a moment to create its icon.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            // Background-only apps (most launches) can't have menu bar icons.
+            guard let self, !app.isTerminated, app.activationPolicy != .prohibited,
+                  AXIsProcessTrusted(), !self.arranging, !self.peeking else { return }
+            if !self.collapsed { return self.adoptNewStatusItems(checking: id) }
+            self.log("peeking for a new icon of \(app.localizedName ?? id)")
+            self.peeking = true
+            self.setCollapsed(false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                self.adoptNewStatusItems(checking: id) {
+                    self.peeking = false
+                    self.setCollapsed(true)
+                }
+            }
+        }
+    }
+
+    /// Moves icons of apps not seen before from the hidden section to right of "|", then
+    /// remembers all apps with visible icons. `checking` marks an app as icon-less if it has none.
+    private func adoptNewStatusItems(checking app: String? = nil, completion: (() -> Void)? = nil) {
+        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
+        // Not while the user holds a mouse button (see `drag`); look again shortly.
+        if NSEvent.pressedMouseButtons != 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.adoptNewStatusItems(checking: app, completion: completion) }
+            return
+        }
+        let items = statusItemsByApp().filter { $0.frame.midX >= screen.frame.minX && $0.frame.midX < screen.frame.maxX }
+        var known = knownIconApps
+        if let app, !items.contains(where: { $0.app == app }) { appsWithoutIcons.insert(app) }
+        // First run: everything already in the menu bar is where the user wants it.
+        if known.isEmpty {
+            knownIconApps = Set(items.map(\.app))
+            completion?()
+            return
+        }
+        guard let boundary = itemFrame(Label.toggle, on: screen) else { completion?(); return }
+        let newHidden = items.filter { !known.contains($0.app) && $0.frame.midX < boundary.minX }
+        known.formUnion(items.map(\.app))
+        knownIconApps = known
+        // Many unknown icons at once are an existing arrangement (e.g. settings were lost), not
+        // new apps, so they're only remembered. New apps come one or two at a time.
+        guard let item = newHidden.first, newHidden.count <= 3 else { completion?(); return }
+        log("new icon of \(item.app) in the hidden section: moving it right of |")
+        arranging = true
+        // Dropping onto the right part of "|" inserts after it.
+        drag(from: item.frame.midX, to: boundary.maxX - 5, on: screen) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.arranging = false
+                // Several new icons are handled one at a time (positions change after a move):
+                // forget the others again so the next round finds them.
+                var known = self.knownIconApps
+                newHidden.dropFirst().forEach { known.remove($0.app) }
+                self.knownIconApps = known
+                // The move can leave the (invisible) filler on the wrong side of "|", which
+                // would keep the icons from hiding. Re-arranging fixes that, then looks again.
+                self.arrangeItems(then: completion)
+            }
+        }
+    }
+
     // MARK: - Arranging the items
 
     /// Item positions are owned by MenuBarAgent and can't be set through an API, so IconCloak
     /// arranges its items with simulated ⌘-drags (needs Accessibility) and puts the cursor back:
     /// the filler directly left of "|", then "»" in front of the leftmost icon.
-    @objc private func arrangeItems() {
-        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer() else { return }
+    @objc private func arrangeItems() { arrangeItems(then: nil) }
+
+    /// Puts the filler directly left of "|" and "»" in front, then checks for new icons.
+    private func arrangeItems(then completion: (() -> Void)?) {
+        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer() else { completion?(); return }
         arranging = true
         filler.length = NSStatusItem.variableLength
         filler.isVisible = true
@@ -677,7 +832,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let done = { [self] in
                 arranging = false
                 configureButtons() // hides the filler again
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.moveDividerToFront() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    // Wait for that drag to finish, if there is one.
+                    let wait = self.moveDividerToFront() ? 1.2 : 0.1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + wait) { self.adoptNewStatusItems(completion: completion) }
+                }
             }
             guard let f = itemFrame(Label.filler, on: screen), let t = itemFrame(Label.toggle, on: screen),
                   abs(f.maxX - t.minX) > 3 else { return done() }
@@ -693,19 +852,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// ⌘-drags "»" in front of the leftmost menu bar icon, so all icons between it and "|" are
     /// the hidden section.
-    @objc private func moveDividerToFront() {
+    /// Returns whether a drag was started.
+    @discardableResult private func moveDividerToFront() -> Bool {
         guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer(),
               let dividerFrame = itemFrame(Label.divider, on: screen)
-        else { return }
+        else { return false }
         // Only this display's menu bar (every display has one), right of the notch if there is one.
         let start = screen.auxiliaryTopRightArea?.minX ?? screen.frame.minX
         guard let leftmost = menuBarItemFrames()
             .filter({ $0.minX >= start && $0.maxX <= screen.frame.maxX })
             .min(by: { $0.minX < $1.minX })
-        else { return }
-        guard dividerFrame.minX > leftmost.minX + 2 else { return } // already in front
+        else { return false }
+        guard dividerFrame.minX > leftmost.minX + 2 else { return false } // already in front
         log("moving » from x=\(Int(dividerFrame.midX)) to x=\(Int(leftmost.minX + 3))")
         drag(from: dividerFrame.midX, to: leftmost.minX + 3, on: screen)
+        return true
     }
 
     /// Where one of IconCloak's items actually is on `screen`'s menu bar (global top-left
@@ -729,8 +890,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Simulates a ⌘-drag along the menu bar of `screen`, then restores the cursor.
+    ///
+    /// Keep this event sequence exactly as it is. macOS reorders status items with a WindowServer
+    /// window drag, and extra simulated events around the drop (a pointer move right after it,
+    /// key events for ⌘) have left the WindowServer unable to track any drag, the user's
+    /// included, until logout. Verify changes with one drag and the system log
+    /// (WindowServer, "window drag trait gesture" must not appear).
     private func drag(from x0: CGFloat, to x1: CGFloat, on screen: NSScreen?, completion: (() -> Void)? = nil) {
-        guard let screen, let primary = NSScreen.screens.first else { completion?(); return }
+        // Never while the user holds a mouse button (e.g. is dragging an icon): two drags at once
+        // don't work, and this one would take the pointer away mid-drag.
+        guard let screen, let primary = NSScreen.screens.first, NSEvent.pressedMouseButtons == 0 else { completion?(); return }
+        ownDragUntil = Date().addingTimeInterval(2)
         // CoreGraphics uses top-left coordinates from the primary display; x is shared with AppKit.
         let y = primary.frame.maxY - screen.frame.maxY + 12
         let restore = CGEvent(source: nil)?.location
@@ -752,7 +922,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             post(.leftMouseUp, x1)
             if let restore { CGWarpMouseCursorPosition(restore) }
             completion?()
+            // The icon under the drop point never saw the pointer leave (the warp sends no
+            // events), so its tooltip can appear at the restored position and stay for good.
+            // Clear it, but only once macOS is completely done with the drop.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.releaseStrandedHover() }
         }
+    }
+
+    /// See `drag`: a tooltip left behind by one of IconCloak's own drags.
+    private func releaseStrandedHover() {
+        guard Date() >= ownDragUntil, !collapsed, NSEvent.pressedMouseButtons == 0, foreignTooltipVisible() else { return }
+        releaseHover(reason: "after moving an item")
     }
 
     /// Frames (global top-left coordinates) of all status items MenuBarAgent is drawing.
@@ -868,10 +1048,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Development controls
 
     #if ICONCLOAK_DEV
+    static var evLines: [String] = []
     /// Remote control for automated testing, compiled only into dev builds
     /// (`scripts/build-app.sh --dev`). Any local process can post these notifications, and
     /// IconCloak holds the Accessibility permission, so this must never ship in a release.
-    /// Usage: `build/ctl collapse|expand|log|axdump|pressoverflow|click:x,y|cmddrag:x1,x2|autohide:<s>`.
+    /// Usage: `build/ctl collapse|expand|log|axdump|extras|trace|evlog:<s>|nowatch|misplace|fillervis:0/1|pressoverflow|click:x,y|cmddrag:x1,x2|autohide:<s>|len:<item>,<n>|front|arrange`.
     private func installDevControls() {
         DistributedNotificationCenter.default().addObserver(forName: .init("dev.iconcloak.cmd"), object: nil, queue: .main) { [weak self] note in
             guard let self, let cmd = note.object as? String else { return }
@@ -884,6 +1065,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let item = parts[0] == "toggle" ? self.toggle! : parts[0] == "filler" ? self.filler! : self.divider!
                 item.length = n < 0 ? NSStatusItem.variableLength : CGFloat(n)
                 self.log("len \(parts[0]) = \(n)")
+            case "misplace":
+                // Puts the filler right of "|" (a broken order) to test the repair.
+                guard !self.collapsed, let screen = self.targetScreen() else { return }
+                self.filler.length = NSStatusItem.variableLength
+                self.filler.isVisible = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    guard let f = self.itemFrame(Label.filler, on: screen), let t = self.itemFrame(Label.toggle, on: screen) else { return }
+                    self.log("misplacing filler (x=\(Int(f.midX)) → \(Int(t.maxX - 3)))")
+                    self.drag(from: f.midX, to: t.maxX - 3, on: screen) {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.configureButtons() }
+                    }
+                }
+            case "fillervis:1": self.filler.length = NSStatusItem.variableLength; self.filler.isVisible = true
+            case "fillervis:0": self.filler.isVisible = false
+            case let c where c.hasPrefix("evlog:"):
+                // Logs every mouse / modifier event the session sees for N seconds (listen-only).
+                let seconds = Double(c.dropFirst(6)) ?? 5
+                var mask: CGEventMask = 0
+                for t in [CGEventType.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved, .flagsChanged, .keyDown, .keyUp] { mask |= CGEventMask(1 << t.rawValue) }
+                let start = CFAbsoluteTimeGetCurrent()
+                Self.evLines = []
+                guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                                  eventsOfInterest: mask, callback: { _, type, e, _ in
+                    let f: (CGEventField) -> Int64 = { e.getIntegerValueField($0) }
+                    AppDelegate.evLines.append(String(format: "%.3f type=%d loc=%.0f,%.0f flags=%llx num=%lld click=%lld dx=%lld dy=%lld sub=%lld press=%.2f btn=%lld user=%llx pid=%lld state=%lld key=%lld",
+                        CFAbsoluteTimeGetCurrent(), type.rawValue, e.location.x, e.location.y, e.flags.rawValue,
+                        f(.mouseEventNumber), f(.mouseEventClickState), f(.mouseEventDeltaX), f(.mouseEventDeltaY), f(.mouseEventSubtype),
+                        e.getDoubleValueField(.mouseEventPressure), f(.mouseEventButtonNumber), f(.eventSourceUserData),
+                        f(.eventSourceUnixProcessID), f(.eventSourceStateID), f(.keyboardEventKeycode)))
+                    return Unmanaged.passUnretained(e)
+                }, userInfo: nil) else { self.log("evlog: no tap"); return }
+                let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
+                CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+                self.log("evlog started")
+                DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+                    CGEvent.tapEnable(tap: tap, enable: false)
+                    CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+                    let path = NSTemporaryDirectory() + "iconcloak-evlog.txt"
+                    let lines = AppDelegate.evLines.map { l -> String in
+                        guard let t = Double(l.prefix(while: { $0 != " " })) else { return l }
+                        return String(format: "%7.3f", t - start) + l.drop(while: { $0 != " " })
+                    }
+                    try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+                    self.log("evlog: \(lines.count) events → \(path)")
+                }
+            case "nowatch": self.screenWatch?.invalidate(); self.log("screen watch stopped")
+            case "trace":
+                // Logs where "|" and the filler are, every 0.15 s for 4 s.
+                for i in 0..<27 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 0.15) {
+                        guard let screen = self.targetScreen() else { return }
+                        let t = self.itemFrame(Label.toggle, on: screen).map { "\(Int($0.minX))..\(Int($0.maxX))" } ?? "none"
+                        let f = self.itemFrame(Label.filler, on: screen).map { "\(Int($0.minX))..\(Int($0.maxX))" } ?? "none"
+                        let o = self.overflowButtons().map { "\(Int($0.frame.minX))" }.joined(separator: ",")
+                        self.log("trace \(i): | \(t)  filler \(f)  « \(o)")
+                    }
+                }
             case "menu": self.showMenu(on: self.collapsed ? self.toggle : self.divider)
             case "settings": SettingsWindow.shared.show()
             case let c where c.hasPrefix("cover:"):
@@ -895,6 +1133,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "underPageBackground": .underPageBackground,
                 ]
                 if let m = names[String(c.dropFirst(6))] { self.coverMaterial = m; self.updateCovers() }
+            case "extras":
+                // Status items per app, from each app's own accessibility (AXExtrasMenuBar).
+                var total = 0
+                for app in NSWorkspace.shared.runningApplications {
+                    let ax = AXUIElementCreateApplication(app.processIdentifier)
+                    var bar: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(ax, kAXExtrasMenuBarAttribute as CFString, &bar) == .success, let bar else { continue }
+                    let items = self.axChildren(bar as! AXUIElement)
+                    total += items.count
+                    let desc = items.map { "\(self.axString($0, kAXDescriptionAttribute) ?? self.axString($0, kAXTitleAttribute) ?? "?") @\(Int(self.axFrame($0).minX))" }
+                    self.log("extras \(app.localizedName ?? "?") (\(app.bundleIdentifier ?? "-")): \(desc)")
+                }
+                self.log("extras total: \(total)")
             case "front": self.moveDividerToFront()
             case "arrange": self.arrangeItems()
             case "collapse": self.setCollapsed(true)
