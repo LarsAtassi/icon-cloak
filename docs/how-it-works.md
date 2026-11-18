@@ -110,14 +110,13 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
 - **Arranging the items.** Item positions are owned by `MenuBarAgent` and aren't stored
   anywhere an app can change (the app's defaults only hold a visibility flag). So IconCloak
   posts ⌘-drags with `CGEvent` (then restores the cursor) to put the filler directly left
-  of `|` and `»` in front of the leftmost icon. This happens at launch, from the menu, and
-  half a second after the user ⌘-drags something in the menu bar (a global `leftMouseUp`
-  monitor), so icons can't be placed left of `»`.
+  of `|` and `»` in front of the leftmost icon. This happens at launch, from the settings,
+  and after the user ⌘-dragged something in the menu bar (a global `leftMouseUp` monitor),
+  so icons can't be placed left of `»`.
 - **New icons.** macOS puts a new app's status item at the far left, which is the hidden
   section, so new icons would disappear right away. IconCloak remembers which apps' icons it
   has seen (by bundle ID). When an unknown app's icon shows up left of `|`, it ⌘-drags it right
-  of `|`, then re-arranges its own items, since the move can leave the invisible filler on the
-  wrong side of `|` (which keeps the right filler from ever fitting). Hidden icons can't be
+  of `|` (with the filler visible, see below), then checks the arrangement of its own items. Hidden icons can't be
   seen through accessibility at all, so when an unknown app launches while collapsed,
   IconCloak briefly expands to check. Background-only apps are skipped, and apps without an
   icon are remembered too. On the first run, everything already in the menu bar counts as
@@ -129,13 +128,26 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
   (the filler is then the rightmost of its items), shows the icons, re-arranges and hides
   again, once. And if shrinking and growing the right filler keeps repeating, it stops after
   three rounds, shows the icons and pauses auto-hide.
-- **Its own drags.** IconCloak never starts a drag while a mouse button is held (you may be
-  dragging an icon yourself), and it ignores the mouse-up of its own drags, which otherwise
-  look like yours when the pointer is put back onto the menu bar. After a drag the pointer is
-  put back without events, so the icon under the drop point still thinks it's hovered and
-  may show its tooltip at the restored position for good. Two seconds after a drag, if
-  another app's tooltip is on screen, IconCloak moves the pointer away for a moment, as it
-  does before hiding.
+- **Its own drags.** A simulated drag takes the real pointer for about a second, and checking
+  the arrangement shifts the icons for a moment (the filler has to be shown to be found). So
+  IconCloak waits for a quiet moment first: no mouse button held and the pointer at rest for
+  0.7 s away from the menu bar (on the menu bar a rest usually means aiming at the next
+  icon, so there it takes 4 s). It waits at most 30 s, though it never drags while a button
+  is held. After the user's own ⌘-drags there's no time limit: it checks once, when they've
+  left the menu bar, not after every drop. If the icons get hidden before that, it checks
+  right before hiding, since a filler pushed aside would keep them from hiding. It ignores the mouse-up of
+  its own drags, which otherwise look like the user's when the pointer is put back onto the
+  menu bar. After a drag the pointer is put back without events, so the icon under the drop
+  point still thinks it's hovered and may show its tooltip at the restored position for
+  good. Two seconds after a drag (and again only in a quiet moment), if another app's tooltip
+  is on screen, IconCloak moves the pointer away for an instant, as it does before hiding.
+  When it hides within a few seconds of one of its drags, it does that unconditionally one
+  second after the drop, because the tooltip may not be up yet.
+- **The filler goes last.** A drag made while the filler is hidden can push it one place
+  aside (this also happens with the user's own drags across `|`). So when arranging, the
+  filler is made visible first, `»` is moved if needed, and the filler is placed last (and checked once more: while the other icons are still
+  sliding aside, a drop can land one place short). A new
+  icon is moved with the filler visible too, which keeps it in place, so one drag is enough.
 - **Don't touch the drag sequence.** macOS 27.2 reorders status items with a WindowServer
   window drag (`MenuBarAgent` logs `com.apple.menubar:drag`, the WindowServer logs under
   `windowinteraction`). Extra simulated events around the drop (a pointer move 50 ms after

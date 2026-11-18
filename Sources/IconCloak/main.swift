@@ -57,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastMeasuredInset: CGFloat?
     private var misplacedFillerChecks = 0
     private var ownDragUntil = Date.distantPast // IconCloak's own simulated drag is in progress
+    private var needsArrange = false            // the user ⌘-dragged; arrangement not checked yet
+    private var lastOwnDragEnd = Date.distantPast
     private var repairedFiller = false      // once per hide
     private var shrunkSinceResize = false
     private var regrowCycles = 0            // shrink → grow back cycles in this hide
@@ -142,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.ensureOrder()
             self.rolesReady = true
             self.scheduleAutoHide()
-            self.arrangeItems()
+            self.whenQuiet(maxWait: 4) { self.arrangeItems() }
         }
         // Keep the arrangement after the user ⌘-drags something in the menu bar: "»" back in
         // front, the filler next to "|" (global mouse monitors need Accessibility).
@@ -151,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, Date() >= self.ownDragUntil,
                   !self.collapsed, event.modifierFlags.contains(.command),
                   let screen = self.screenWithPointer(), NSEvent.mouseLocation.y > screen.frame.maxY - 40 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.arrangeItems() }
+            self.userDraggedInMenuBar()
         }
 
         // didLaunchApplicationNotification skips apps without a Dock icon, which are most apps
@@ -225,11 +227,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard value != collapsed, rolesReady, !arranging else { return }
         if value, !hoverReleased, AXIsProcessTrusted(), foreignTooltipVisible() {
             hoverReleased = true
-            releaseHover(reason: "before hiding")
+            releaseHover(reason: "before hiding (another app's tooltip was showing)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.setCollapsed(true) }
             return
         }
         hoverReleased = false
+        // The user ⌘-dragged and the arrangement hasn't been checked since: do it now, before
+        // hiding (a filler pushed aside would keep the icons from hiding).
+        if value, needsArrange, AXIsProcessTrusted() {
+            needsArrange = false
+            // Asked for by the user on the menu bar (click on "»"): right away. Otherwise
+            // (auto-hide, shortcut) when the pointer is at rest.
+            whenQuiet(superseding: "arrange", maxWait: userIsInMenuBar() ? 0 : 30) {
+                self.arrangeItems { self.setCollapsed(true) }
+            }
+            return
+        }
+        // Right after one of IconCloak's own drags, the icon under the drop point still thinks
+        // it's hovered (the pointer was put back without events). Hidden like that, its tooltip
+        // would show up later and stay. So let it know first, once macOS is done with the drop.
+        if value, AXIsProcessTrusted(), Date().timeIntervalSince(lastOwnDragEnd) < 4 {
+            let wait = max(0, 1 - Date().timeIntervalSince(lastOwnDragEnd))
+            lastOwnDragEnd = .distantPast
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self else { return }
+                if NSEvent.pressedMouseButtons == 0 { self.releaseHover(reason: "after moving an item, before hiding") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.setCollapsed(true) }
+            }
+            return
+        }
         if value, let screen = targetScreen(), let frame = itemFrame(Label.toggle, on: screen) {
             expandedInset = screen.frame.maxX - frame.maxX
             toggleRightInset = screen.frame.maxX - frame.maxX + collapsedExtra
@@ -274,7 +300,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if value { autoHideTimer?.invalidate() } else if !peeking { scheduleAutoHide() }
         log("---- \(value ? "COLLAPSE" : "EXPAND") ----")
         if !value && !peeking {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.adoptNewStatusItems() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self else { return }
+                // An arrangement that was still due when the icons got hidden.
+                if self.needsArrange { self.whenQuiet(superseding: "arrange") { self.arrangeItems() } }
+                else { self.adoptNewStatusItems() }
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.logState(label: value ? "collapsed" : "expanded") }
     }
@@ -581,7 +612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: location.x, y: location.y + 150),
                 mouseButton: .left)?.post(tap: .cghidEventTap)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { CGWarpMouseCursorPosition(location) }
-        log("released hover \(reason) (another app's tooltip was showing)")
+        log("released hover \(reason)")
     }
 
     private func screenWithPointer() -> NSScreen? {
@@ -757,30 +788,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Give the app a moment to create its icon.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             // Background-only apps (most launches) can't have menu bar icons.
-            guard let self, !app.isTerminated, app.activationPolicy != .prohibited,
-                  AXIsProcessTrusted(), !self.arranging, !self.peeking else { return }
+            guard let self, !app.isTerminated, app.activationPolicy != .prohibited, AXIsProcessTrusted() else { return }
             if !self.collapsed { return self.adoptNewStatusItems(checking: id) }
-            self.log("peeking for a new icon of \(app.localizedName ?? id)")
-            self.peeking = true
-            self.setCollapsed(false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                self.adoptNewStatusItems(checking: id) {
-                    self.peeking = false
-                    self.setCollapsed(true)
+            // Hidden icons can't be seen, so show them for a moment, when the user isn't busy.
+            self.whenQuiet {
+                guard self.collapsed, !self.arranging, !self.peeking, !app.isTerminated else { return }
+                self.log("peeking for a new icon of \(app.localizedName ?? id)")
+                self.peeking = true
+                self.setCollapsed(false)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    self.adoptNewStatusItems(checking: id) { self.endPeek() }
                 }
             }
         }
     }
 
-    /// Moves icons of apps not seen before from the hidden section to right of "|", then
-    /// remembers all apps with visible icons. `checking` marks an app as icon-less if it has none.
+    /// After the user ⌘-dragged something in the menu bar, check the arrangement, but only once
+    /// they're done there: it shifts the icons for a moment and may take the pointer, and the
+    /// user may be about to drag the next icon.
+    private func userDraggedInMenuBar() {
+        needsArrange = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            // No time limit: while the user stays on the menu bar, nothing happens. If the icons
+            // get hidden first, `setCollapsed` checks the arrangement before hiding.
+            self.whenQuiet(superseding: "arrange", maxWait: .infinity) {
+                if self.needsArrange { self.arrangeItems() }
+            }
+        }
+    }
+
+    private func endPeek(tries: Int = 5) {
+        peeking = false
+        setCollapsed(true)
+        // Hiding is refused while items are being arranged; try again shortly.
+        if !collapsed, tries > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.endPeek(tries: tries - 1) }
+        }
+    }
+
+    /// Finds icons of apps not seen before in the hidden section and moves them right of "|";
+    /// remembers all other apps with visible icons. `checking` marks an app as icon-less if it
+    /// has none.
     private func adoptNewStatusItems(checking app: String? = nil, completion: (() -> Void)? = nil) {
         guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
-        // Not while the user holds a mouse button (see `drag`); look again shortly.
-        if NSEvent.pressedMouseButtons != 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.adoptNewStatusItems(checking: app, completion: completion) }
-            return
-        }
         let items = statusItemsByApp().filter { $0.frame.midX >= screen.frame.minX && $0.frame.midX < screen.frame.maxX }
         var known = knownIconApps
         if let app, !items.contains(where: { $0.app == app }) { appsWithoutIcons.insert(app) }
@@ -791,28 +841,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let boundary = itemFrame(Label.toggle, on: screen) else { completion?(); return }
-        let newHidden = items.filter { !known.contains($0.app) && $0.frame.midX < boundary.minX }
-        known.formUnion(items.map(\.app))
-        knownIconApps = known
+        let newApps = Set(items.filter { !known.contains($0.app) && $0.frame.midX < boundary.minX }.map(\.app))
         // Many unknown icons at once are an existing arrangement (e.g. settings were lost), not
         // new apps, so they're only remembered. New apps come one or two at a time.
-        guard let item = newHidden.first, newHidden.count <= 3 else { completion?(); return }
-        log("new icon of \(item.app) in the hidden section: moving it right of |")
+        let move = newApps.count <= 3 ? newApps : []
+        known.formUnion(items.map(\.app).filter { !move.contains($0) })
+        knownIconApps = known
+        guard let next = move.sorted().first else { completion?(); return }
+        // Moving it takes the pointer for about a second, so wait until the user isn't using it.
+        whenQuiet { self.moveNewIcon(of: next, completion: completion) }
+    }
+
+    /// Moves the icon of `app` from the hidden section to right of "|", then looks for more.
+    private func moveNewIcon(of app: String, completion: (() -> Void)?) {
+        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
+        knownIconApps.insert(app) // one attempt per app, also if it fails
         arranging = true
-        // Dropping onto the right part of "|" inserts after it.
-        drag(from: item.frame.midX, to: boundary.maxX - 5, on: screen) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.arranging = false
-                // Several new icons are handled one at a time (positions change after a move):
-                // forget the others again so the next round finds them.
-                var known = self.knownIconApps
-                newHidden.dropFirst().forEach { known.remove($0.app) }
-                self.knownIconApps = known
-                // The move can leave the (invisible) filler on the wrong side of "|", which
-                // would keep the icons from hiding. Re-arranging fixes that, then looks again.
-                self.arrangeItems(then: completion)
+        // With the filler visible, the drop can't change which side of "|" it's on.
+        filler.length = NSStatusItem.variableLength
+        filler.isVisible = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+            guard let boundary = itemFrame(Label.toggle, on: screen),
+                  let item = statusItemsByApp().first(where: { $0.app == app && $0.frame.midX < boundary.minX
+                                                               && $0.frame.midX >= screen.frame.minX })
+            else {
+                arranging = false
+                configureButtons() // hides the filler again
+                completion?()
+                return
+            }
+            log("new icon of \(app) in the hidden section: moving it right of |")
+            // Dropping onto the right part of "|" inserts after it.
+            drag(from: item.frame.midX, to: boundary.maxX - 5, on: screen) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.arranging = false
+                    // Checks the filler and "»" (normally nothing to do), then looks for more.
+                    self.arrangeItems(then: completion)
+                }
             }
         }
+    }
+
+    // MARK: - Waiting for a quiet moment
+
+    private var quietGeneration: [String: Int] = [:]
+
+    /// Runs `action` once the user isn't using the mouse: no button held, the pointer away from
+    /// the menu bar and at rest for a moment. IconCloak's simulated drags take the pointer for
+    /// about a second and checking the arrangement shifts the icons, which is jarring
+    /// mid-movement. After `maxWait` only a held button still delays it. With `superseding`, a newer request with the same
+    /// key replaces a waiting one.
+    private func whenQuiet(superseding key: String? = nil, maxWait: TimeInterval = 30, _ action: @escaping () -> Void) {
+        var generation = 0
+        if let key {
+            generation = (quietGeneration[key] ?? 0) + 1
+            quietGeneration[key] = generation
+        }
+        let deadline = Date().addingTimeInterval(maxWait)
+        func check() {
+            if let key, quietGeneration[key] != generation { return }
+            let idle = [CGEventType.mouseMoved, .leftMouseDragged, .leftMouseDown, .leftMouseUp, .scrollWheel]
+                .map { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) }.min() ?? 0
+            // A pointer resting on the menu bar usually means the user is aiming at the next
+            // icon (short pauses between drags), so there it takes a much longer rest.
+            let quiet = idle >= (userIsInMenuBar() ? 4 : 0.7)
+            if NSEvent.pressedMouseButtons == 0, quiet || Date() >= deadline {
+                action()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { check() }
+            }
+        }
+        check()
     }
 
     // MARK: - Arranging the items
@@ -822,51 +921,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the filler directly left of "|", then "»" in front of the leftmost icon.
     @objc private func arrangeItems() { arrangeItems(then: nil) }
 
-    /// Puts the filler directly left of "|" and "»" in front, then checks for new icons.
+    /// Puts "»" in front and the filler directly left of "|", then checks for new icons.
     private func arrangeItems(then completion: (() -> Void)?) {
         guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer() else { completion?(); return }
         arranging = true
+        needsArrange = false
+        log("checking the arrangement")
         filler.length = NSStatusItem.variableLength
         filler.isVisible = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
-            let done = { [self] in
-                arranging = false
-                configureButtons() // hides the filler again
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    // Wait for that drag to finish, if there is one.
-                    let wait = self.moveDividerToFront() ? 1.2 : 0.1
-                    DispatchQueue.main.asyncAfter(deadline: .now() + wait) { self.adoptNewStatusItems(completion: completion) }
+            func placeFiller(attempt: Int = 1) {
+                let done = { [self] in
+                    arranging = false
+                    configureButtons() // hides the filler again
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.adoptNewStatusItems(completion: completion) }
+                }
+                guard let f = itemFrame(Label.filler, on: screen), let t = itemFrame(Label.toggle, on: screen),
+                      abs(f.maxX - t.minX) > 3, attempt <= 2 else { return done() }
+                // Dropping onto the left part of "|" inserts before it; approaching from the left,
+                // stop just short of it.
+                let target = f.midX < t.minX ? t.minX - 4 : t.minX + 3
+                log("moving filler next to | (x=\(Int(f.midX)) → \(Int(target)))")
+                drag(from: f.midX, to: target, on: screen) {
+                    // Look again: while the other icons are still sliding aside, the drop can
+                    // land one place short.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { placeFiller(attempt: attempt + 1) }
                 }
             }
-            guard let f = itemFrame(Label.filler, on: screen), let t = itemFrame(Label.toggle, on: screen),
-                  abs(f.maxX - t.minX) > 3 else { return done() }
-            // Dropping onto the left part of "|" inserts before it; approaching from the left,
-            // stop just short of it.
-            let target = f.midX < t.minX ? t.minX - 4 : t.minX + 3
-            log("moving filler next to | (x=\(Int(f.midX)) → \(Int(target)))")
-            drag(from: f.midX, to: target, on: screen) {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { done() }
+            // "»" first and the filler last, visible all the while: a drag made while the filler
+            // is hidden can push it one place aside.
+            if let move = dividerMove(on: screen) {
+                log("moving » from x=\(Int(move.from)) to x=\(Int(move.to))")
+                drag(from: move.from, to: move.to, on: screen) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { placeFiller() }
+                }
+            } else {
+                placeFiller()
             }
         }
     }
 
-    /// ⌘-drags "»" in front of the leftmost menu bar icon, so all icons between it and "|" are
-    /// the hidden section.
-    /// Returns whether a drag was started.
-    @discardableResult private func moveDividerToFront() -> Bool {
-        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer(),
-              let dividerFrame = itemFrame(Label.divider, on: screen)
-        else { return false }
+    /// The ⌘-drag that puts "»" in front of the leftmost menu bar icon (so all icons between it
+    /// and "|" are the hidden section), or nil if it's already there.
+    private func dividerMove(on screen: NSScreen) -> (from: CGFloat, to: CGFloat)? {
+        guard let dividerFrame = itemFrame(Label.divider, on: screen) else { return nil }
         // Only this display's menu bar (every display has one), right of the notch if there is one.
         let start = screen.auxiliaryTopRightArea?.minX ?? screen.frame.minX
         guard let leftmost = menuBarItemFrames()
             .filter({ $0.minX >= start && $0.maxX <= screen.frame.maxX })
-            .min(by: { $0.minX < $1.minX })
-        else { return false }
-        guard dividerFrame.minX > leftmost.minX + 2 else { return false } // already in front
-        log("moving » from x=\(Int(dividerFrame.midX)) to x=\(Int(leftmost.minX + 3))")
-        drag(from: dividerFrame.midX, to: leftmost.minX + 3, on: screen)
-        return true
+            .min(by: { $0.minX < $1.minX }),
+            dividerFrame.minX > leftmost.minX + 2 // else it's already in front
+        else { return nil }
+        return (dividerFrame.midX, leftmost.minX + 3)
     }
 
     /// Where one of IconCloak's items actually is on `screen`'s menu bar (global top-left
@@ -921,18 +1027,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + hold + stepTime * Double(steps) + 0.2) {
             post(.leftMouseUp, x1)
             if let restore { CGWarpMouseCursorPosition(restore) }
+            self.lastOwnDragEnd = Date()
             completion?()
             // The icon under the drop point never saw the pointer leave (the warp sends no
             // events), so its tooltip can appear at the restored position and stay for good.
             // Clear it, but only once macOS is completely done with the drop.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.releaseStrandedHover() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.whenQuiet(superseding: "hover") { self?.releaseStrandedHover() }
+            }
         }
     }
 
     /// See `drag`: a tooltip left behind by one of IconCloak's own drags.
     private func releaseStrandedHover() {
         guard Date() >= ownDragUntil, !collapsed, NSEvent.pressedMouseButtons == 0, foreignTooltipVisible() else { return }
-        releaseHover(reason: "after moving an item")
+        releaseHover(reason: "after moving an item (another app's tooltip was showing)")
     }
 
     /// Frames (global top-left coordinates) of all status items MenuBarAgent is drawing.
@@ -1110,6 +1219,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
                     self.log("evlog: \(lines.count) events → \(path)")
                 }
+            case let c where c.hasPrefix("userdrag:"):
+                // Like cmddrag, but IconCloak treats it as the user's drag (tests the reaction).
+                let p = c.dropFirst(9).split(separator: ",").compactMap { Double($0) }
+                guard p.count == 2 else { return }
+                self.drag(from: p[0], to: p[1], on: NSScreen.screens.first) { self.userDraggedInMenuBar() }
             case "nowatch": self.screenWatch?.invalidate(); self.log("screen watch stopped")
             case "trace":
                 // Logs where "|" and the filler are, every 0.15 s for 4 s.
@@ -1146,7 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.log("extras \(app.localizedName ?? "?") (\(app.bundleIdentifier ?? "-")): \(desc)")
                 }
                 self.log("extras total: \(total)")
-            case "front": self.moveDividerToFront()
+            case "front": self.arrangeItems()
             case "arrange": self.arrangeItems()
             case "collapse": self.setCollapsed(true)
             case "expand": self.setCollapsed(false)

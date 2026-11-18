@@ -85,8 +85,9 @@ are hidden at that moment, they're shown for a second while it does that). After
 icon stays wherever you drag it.
 
 `»` always stays in front of the leftmost icon. If you drag an icon to its left, IconCloak
-moves `»` back in front after a moment (your mouse pointer briefly jumps), and the icon
-becomes one of the hidden ones.
+moves `»` back in front once you've left the menu bar and stopped moving the mouse (the
+pointer briefly jumps to the menu bar and back), or right before the icons are hidden. The
+icon becomes one of the hidden ones.
 
 ## Update
 
