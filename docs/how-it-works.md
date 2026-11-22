@@ -157,6 +157,13 @@ Collapsed:  [app menus][filler] (notch) [| as filler] [«] [visible icons]
   one drag and check the log before doing more:
   `/usr/bin/log show --last 1m --info --predicate 'process == "WindowServer" AND eventMessage CONTAINS "window drag trait"'`
   (a healthy drag has one `commitDragMovement` per step and no such error).
+- **Standing by on external displays** (optional). Displays without a notch are where this
+  approach is weakest, and a wide display has room for all icons anyway. With the setting on,
+  IconCloak is only in use while the main display (`NSScreen.screens.first`) is the built-in
+  one (`CGDisplayIsBuiltin`); otherwise it shows the icons, refuses to hide and sets its three
+  items to `isVisible = false`, which macOS restores in place later. Since `»` and its menu
+  are gone then, launching the app a second time (which quits again right away) sends the
+  running one a distributed notification to open its settings.
 - **Expanding** animates the items shrinking back from filler width (~300 ms, drawn by
   `MenuBarAgent`, so `NSAnimationContext` can't turn it off). During that time `»` and `|`
   are drawn transparent: they take their final width, so nothing shifts when they appear,

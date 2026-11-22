@@ -101,6 +101,12 @@ final class SettingsModel: ObservableObject {
             onDisplayModeChanged?()
         }
     }
+    @Published var builtInDisplayOnly: Bool = UserDefaults.standard.bool(forKey: "builtInDisplayOnly") {
+        didSet {
+            UserDefaults.standard.set(builtInDisplayOnly, forKey: "builtInDisplayOnly")
+            onDisplayModeChanged?()
+        }
+    }
 
     private func saveAutoHide() {
         UserDefaults.standard.set(autoHideEnabled ? max(autoHideSeconds, 1) : 0, forKey: "autoHideDelay")
@@ -135,6 +141,10 @@ struct SettingsView: View {
                 Text(model.mainDisplayOnly
                      ? "Menu bar items have the same width on every display, so displays the same size as the main one hide the icons too."
                      : "Hiding is set up for the display your pointer is on.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Toggle("Turn off when the main display is an external one", isOn: $model.builtInDisplayOnly)
+                Text("With an external display as the main display (or the lid closed), IconCloak shows all icons and removes its own » and |. To get back to these settings then, open IconCloak again from Applications.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

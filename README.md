@@ -19,8 +19,9 @@ Hide menu bar icons on macOS 27. A small, open-source take on
   The icons between them get hidden. Hold **⌘** and drag icons in or out.
 - **Auto-hide (optional):** hide the icons again a set number of seconds after expanding.
   It waits while your pointer is on the menu bar or a menu is open.
-- **Settings:** auto-hide, your own keyboard shortcut, launch at login, and whether to hide
-  icons only on the main display.
+- **Settings:** auto-hide, your own keyboard shortcut, launch at login, whether to hide
+  icons only on the main display, and whether IconCloak turns itself off while an external
+  display is the main one.
 - **New icons stay visible.** macOS puts the icon of a newly installed app at the far left,
   which would hide it right away. IconCloak moves it next to your visible icons instead
   (briefly showing the hidden icons if they're collapsed). Where you put it afterwards sticks.

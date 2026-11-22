@@ -105,9 +105,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let me = NSRunningApplication.current
         if let bundleID = Bundle.main.bundleIdentifier,
            NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).contains(where: { $0 != me }) {
-            log("another IconCloak is already running, quitting \(Bundle.main.bundlePath)")
-            NSApp.terminate(nil)
+            // Opening the app again is the way to its settings while "»" isn't in the menu bar.
+            log("another IconCloak is already running: asking it to show its settings, quitting \(Bundle.main.bundlePath)")
+            DistributedNotificationCenter.default().postNotificationName(Self.showSettingsNotification, object: nil,
+                                                                         userInfo: nil, deliverImmediately: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
             return
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Self.showSettingsNotification, object: nil, queue: .main) { _ in
+            SettingsWindow.shared.show()
         }
         // macOS 27 decides the initial order itself, so roles are assigned by position
         // (see ensureOrder): the left item is the divider, the right one the toggle.
@@ -130,9 +136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.onOpenLog = { [weak self] in self?.openLog() }
         settings.onDisplayModeChanged = { [weak self] in
             guard let self else { return }
-            self.log("hide on main display only: \(UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly"))")
+            self.log("hide on main display only: \(UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly")), "
+                     + "off on external main display: \(UserDefaults.standard.bool(forKey: "builtInDisplayOnly"))")
             self.fillerScreen = nil
             self.autoHideSuspended = false
+            self.updateStandby()
             self.updateFillers()
         }
         settings.logMessage = { [weak self] in self?.log($0) }
@@ -143,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             self.ensureOrder()
             self.rolesReady = true
+            self.updateStandby()
             self.scheduleAutoHide()
             self.whenQuiet(maxWait: 4) { self.arrangeItems() }
         }
@@ -173,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.log("screen parameters changed: \(NSScreen.screens.map { "\($0.localizedName) \($0.frame)" })")
             self.fillerScreen = nil
             self.autoHideSuspended = false
+            self.updateStandby()
             self.updateFillers()
         }
 
@@ -224,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setCollapsed(_ value: Bool) {
-        guard value != collapsed, rolesReady, !arranging else { return }
+        guard value != collapsed, rolesReady, !arranging, !(value && standingBy) else { return }
         if value, !hoverReleased, AXIsProcessTrusted(), foreignTooltipVisible() {
             hoverReleased = true
             releaseHover(reason: "before hiding (another app's tooltip was showing)")
@@ -333,7 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleAutoHide(after seconds: TimeInterval? = nil) {
         autoHideTimer?.invalidate()
-        guard let delay = autoHideDelay, !collapsed, !autoHideSuspended else { return }
+        guard let delay = autoHideDelay, !collapsed, !autoHideSuspended, !standingBy else { return }
         autoHideTimer = Timer.scheduledTimer(withTimeInterval: seconds ?? TimeInterval(delay), repeats: false) { [weak self] _ in
             guard let self, !self.collapsed else { return }
             // Don't pull icons away while the user is using them: wait until the pointer has
@@ -589,7 +599,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Displays arrangement) when "Only hide icons on the main display" is on, otherwise the
     /// display with the pointer.
     private func targetScreen() -> NSScreen? {
-        if UserDefaults.standard.bool(forKey: "hideOnMainDisplayOnly"), let main = NSScreen.screens.first { return main }
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: "hideOnMainDisplayOnly") || defaults.bool(forKey: "builtInDisplayOnly"),
+           let main = NSScreen.screens.first { return main }
         return screenWithPointer()
     }
 
@@ -747,6 +759,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return v as? String
     }
 
+    // MARK: - Standing by on external displays
+
+    private static let showSettingsNotification = Notification.Name("io.github.larsatassi.IconCloak.showSettings")
+    private var standingBy = false
+
+    /// With "Turn off when the main display is an external one": whether the main display
+    /// (the one with the primary menu bar) is the built-in one. A closed lid counts as external.
+    private var wantedOnCurrentDisplays: Bool {
+        guard UserDefaults.standard.bool(forKey: "builtInDisplayOnly"), let main = NSScreen.screens.first,
+              let id = main.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return true }
+        return CGDisplayIsBuiltin(id) != 0
+    }
+
+    /// Standing by: all icons shown, nothing gets hidden, and IconCloak's own items are out of
+    /// the menu bar, as if it weren't running. (macOS puts them back in the same places.)
+    private func updateStandby() {
+        guard rolesReady else { return }
+        let standby = !wantedOnCurrentDisplays
+        guard standby != standingBy else { return }
+        if arranging { // let a running arrangement finish first
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.updateStandby() }
+            return
+        }
+        if standby {
+            log("main display is an external one: standing by (all icons shown, own items removed)")
+            peeking = false
+            needsArrange = false
+            setCollapsed(false)
+            standingBy = true
+            autoHideTimer?.invalidate()
+            for item in [toggle!, divider!, filler!] { item.isVisible = false }
+        } else {
+            log("no longer standing by: in use again")
+            standingBy = false
+            toggle.isVisible = true
+            divider.isVisible = true
+            configureButtons()
+            autoHideSuspended = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                self.whenQuiet(maxWait: 4) { self.arrangeItems() }
+                self.scheduleAutoHide()
+            }
+        }
+    }
+
     // MARK: - New icons
 
     // macOS puts a new menu bar icon at the far left, which in IconCloak's layout is the hidden
@@ -807,6 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// they're done there: it shifts the icons for a moment and may take the pointer, and the
     /// user may be about to drag the next icon.
     private func userDraggedInMenuBar() {
+        guard !standingBy else { return }
         needsArrange = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             // No time limit: while the user stays on the menu bar, nothing happens. If the icons
@@ -830,7 +888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// remembers all other apps with visible icons. `checking` marks an app as icon-less if it
     /// has none.
     private func adoptNewStatusItems(checking app: String? = nil, completion: (() -> Void)? = nil) {
-        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
+        guard !collapsed, !arranging, !standingBy, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
         let items = statusItemsByApp().filter { $0.frame.midX >= screen.frame.minX && $0.frame.midX < screen.frame.maxX }
         var known = knownIconApps
         if let app, !items.contains(where: { $0.app == app }) { appsWithoutIcons.insert(app) }
@@ -854,7 +912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Moves the icon of `app` from the hidden section to right of "|", then looks for more.
     private func moveNewIcon(of app: String, completion: (() -> Void)?) {
-        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
+        guard !collapsed, !arranging, !standingBy, AXIsProcessTrusted(), let screen = targetScreen() else { completion?(); return }
         knownIconApps.insert(app) // one attempt per app, also if it fails
         arranging = true
         // With the filler visible, the drop can't change which side of "|" it's on.
@@ -923,7 +981,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Puts "»" in front and the filler directly left of "|", then checks for new icons.
     private func arrangeItems(then completion: (() -> Void)?) {
-        guard !collapsed, !arranging, AXIsProcessTrusted(), let screen = screenWithPointer() else { completion?(); return }
+        guard !collapsed, !arranging, !standingBy, AXIsProcessTrusted(), let screen = screenWithPointer() else { completion?(); return }
         arranging = true
         needsArrange = false
         log("checking the arrangement")
@@ -1224,6 +1282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let p = c.dropFirst(9).split(separator: ",").compactMap { Double($0) }
                 guard p.count == 2 else { return }
                 self.drag(from: p[0], to: p[1], on: NSScreen.screens.first) { self.userDraggedInMenuBar() }
+            case let c where c.hasPrefix("builtinonly:"):
+                SettingsModel.shared.builtInDisplayOnly = c.hasSuffix("1")
             case "nowatch": self.screenWatch?.invalidate(); self.log("screen watch stopped")
             case "trace":
                 // Logs where "|" and the filler are, every 0.15 s for 4 s.

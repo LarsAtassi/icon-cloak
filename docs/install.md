@@ -78,6 +78,11 @@ After launch you'll see two new items in the menu bar: `»` and a thin `|`.
     the display your pointer is on. With this on, it's always set up for the main display.
     Displays of the same size as the main one hide the icons too, since menu bar items have
     the same width on every display.
+  - **Turn off when the main display is an external one.** While an external display is your
+    main display (or the lid is closed), IconCloak stands by: all icons are shown, nothing gets
+    hidden, and its own `»` and `|` leave the menu bar. They come back when the built-in
+    display is the main one again. To reach the settings while it stands by, open IconCloak
+    again from Applications.
 
 When an app you haven't used with IconCloak before adds a menu bar icon, macOS puts it at the
 far left, in the hidden section. IconCloak moves it right of `|` so you see it (if the icons
@@ -162,6 +167,12 @@ xattr -dr com.apple.quarantine /Applications/IconCloak.app
 
 IconCloak can't read the app menus. This is almost always the Accessibility permission; see
 [the first entry](#the-accessibility-switch-is-on-but-iconcloak-still-doesnt-work).
+
+### `»` and `|` are gone
+
+If **Turn off when the main display is an external one** is on, IconCloak removes its items
+while an external display is the main display or the lid is closed. Open **IconCloak** again
+from Applications: that shows its settings, where you can switch this off.
 
 ### `»` isn't on the far left
 
